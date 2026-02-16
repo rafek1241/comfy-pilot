@@ -1,10 +1,22 @@
 # Comfy Pilot
 
-MCP server + embedded terminal that lets Claude Code see and edit your ComfyUI workflows.
+[![Stars](https://img.shields.io/github/stars/ConstantineB6/Comfy-Pilot)](https://github.com/ConstantineB6/Comfy-Pilot/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![ComfyUI Registry](https://img.shields.io/badge/ComfyUI-Registry-blue)](https://registry.comfy.org/publishers/constantine/nodes/comfy-pilot)
+
+Talk to your ComfyUI workflows. Comfy Pilot gives Claude Code direct access to see, edit, and run your workflows — with an embedded terminal right inside ComfyUI.
 
 ![Comfy Pilot](thumbnail.jpg)
 
-**[View on ComfyUI Registry](https://registry.comfy.org/publishers/constantine/nodes/comfy-pilot)**
+## Why?
+
+Building ComfyUI workflows means manually searching for nodes, dragging connections, and tweaking values one at a time. With Comfy Pilot, you just describe what you want:
+
+- *"Build me an SDXL workflow with ControlNet"* — Claude creates all the nodes, connects them, and sets the parameters
+- *"Look at the output and increase the detail"* — Claude sees your generated image and adjusts the workflow
+- *"Download the FLUX schnell model and set up a workflow for it"* — Claude downloads the model and builds a workflow from scratch
+
+No copy-pasting node names. No hunting through menus. Just say what you want.
 
 ## Installation
 
@@ -38,6 +50,10 @@ Claude Code CLI will be installed automatically if not found.
 - **Embedded Terminal** - Full xterm.js terminal running Claude Code right inside ComfyUI
 - **Image Viewing** - Claude can see outputs from Preview Image and Save Image nodes
 - **Graph Editing** - Create, delete, move, and connect nodes programmatically
+
+## Demo
+
+https://github.com/user-attachments/assets/325b1194-2334-48a1-94c3-86effd1fef02
 
 ## Usage
 
