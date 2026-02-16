@@ -511,8 +511,15 @@ def edit_graph(operations) -> str:
 
     Returns node_id for create operations so subsequent operations can reference it.
     """
+    if isinstance(operations, str):
+        try:
+            operations = json.loads(operations)
+        except json.JSONDecodeError:
+            return "error: Invalid operations: expected a JSON array or object"
     if isinstance(operations, dict):
         operations = [operations]
+    if not isinstance(operations, list):
+        return "error: Invalid operations: expected a JSON array or object"
 
     # Cache node types for validation
     all_nodes = get_object_info_cached()

@@ -5,6 +5,9 @@ version = "1.0.24"
 license = { file = "LICENSE" }
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.urls]
 Repository = "https://github.com/ConstantineB6/comfy-pilot"
 
@@ -12,3 +15,8 @@ Repository = "https://github.com/ConstantineB6/comfy-pilot"
 PublisherId = "constantine"
 DisplayName = "Comfy Pilot"
 Icon = "https://raw.githubusercontent.com/ConstantineB6/comfy-pilot/main/thumbnail.jpg"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+consider_namespace_packages = false
