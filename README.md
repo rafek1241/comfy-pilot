@@ -1,10 +1,23 @@
 # Comfy Pilot
 
-MCP server + embedded terminal that lets Claude Code see and edit your ComfyUI workflows.
+[![Stars](https://img.shields.io/github/stars/ConstantineB6/Comfy-Pilot)](https://github.com/ConstantineB6/Comfy-Pilot/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![ComfyUI Registry](https://img.shields.io/badge/ComfyUI-Registry-blue)](https://registry.comfy.org/publishers/constantine/nodes/comfy-pilot)
+[![X Post](https://img.shields.io/badge/X-Post-black?logo=x)](https://x.com/whitekontext/status/2016797036482613655/)
 
-![Comfy Pilot](thumbnail.jpg)
+Talk to your ComfyUI workflows. Comfy Pilot gives Claude Code direct access to see, edit, and run your workflows — with an embedded terminal right inside ComfyUI.
 
-**[View on ComfyUI Registry](https://registry.comfy.org/publishers/constantine/nodes/comfy-pilot)**
+https://github.com/ConstantineB6/Comfy-Pilot/releases/download/v1.0.24/comfy-pilot-layout-final.mp4
+
+## Why?
+
+Building ComfyUI workflows means manually searching for nodes, dragging connections, and tweaking values one at a time. With Comfy Pilot, you just describe what you want:
+
+- *"Build me an SDXL workflow with ControlNet"* — Claude creates all the nodes, connects them, and sets the parameters
+- *"Look at the output and increase the detail"* — Claude sees your generated image and adjusts the workflow
+- *"Download the FLUX schnell model and set up a workflow for it"* — Claude downloads the model and builds a workflow from scratch
+
+No copy-pasting node names. No hunting through menus. Just say what you want.
 
 ## Installation
 
