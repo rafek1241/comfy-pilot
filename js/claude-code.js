@@ -1,61 +1,126 @@
 import { app } from "../../scripts/app.js";
 
-// Store reference to floating window globally for context menu access
+const API_BASE = "/comfy-pilot";
+const WS_PATH = "/ws/comfy-pilot-terminal";
+const DEFAULT_CLI_SETTING_ID = "ComfyPilot.defaultCli";
+const SHOW_UNAVAILABLE_SETTING_ID = "ComfyPilot.showUnavailableCliTabs";
+const CLI_OPTIONS = [
+    { value: "claude", label: "Claude Code" },
+    { value: "copilot", label: "GitHub Copilot CLI" },
+    { value: "opencode", label: "OpenCode CLI" },
+    { value: "gemini", label: "Gemini CLI" },
+    { value: "kilo", label: "Kilo Code CLI" },
+];
+
 let floatingWindow = null;
-let terminal = null;
-let fitAddon = null;
-let websocket = null;
-let claudeRunning = false;
+let actionbarReopenButton = null;
+const workspace = {
+    adapters: [],
+    settings: {
+        default_cli: "claude",
+        enabled_clis: CLI_OPTIONS.map((option) => option.value),
+        show_unavailable: false,
+        window_closed: false,
+    },
+    activeAdapterId: null,
+    terminalStates: new Map(),
+    windowSessionId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+};
 
 app.registerExtension({
-    name: "comfy.claude-code",
+    name: "comfy.comfy-pilot",
+    settings: [
+        {
+            id: DEFAULT_CLI_SETTING_ID,
+            name: "Default CLI",
+            type: "combo",
+            defaultValue: "claude",
+            options: CLI_OPTIONS.map((option) => ({ value: option.value, text: option.label })),
+            attrs: {
+                options: CLI_OPTIONS.map((option) => ({ value: option.value, text: option.label })),
+            },
+            onChange: (value) => {
+                void handleDefaultCliSettingChange(value);
+            },
+        },
+        {
+            id: SHOW_UNAVAILABLE_SETTING_ID,
+            name: "Show unavailable CLI tabs",
+            type: "boolean",
+            defaultValue: false,
+            onChange: (value) => {
+                void handleShowUnavailableSettingChange(value);
+            },
+        },
+    ],
 
     async setup() {
-        console.log("Claude Code extension loading...");
+        console.log("Comfy Pilot extension loading...");
 
-        // Load xterm.js
         await loadXtermDependencies();
+        await initializeWorkspaceConfig();
 
-        // Create floating window
         floatingWindow = createFloatingWindow();
         document.body.appendChild(floatingWindow);
 
-        // Make it draggable
-        makeDraggable(floatingWindow, floatingWindow.querySelector(".claude-header"));
-
-        // Make it resizable from all edges
+        makeDraggable(floatingWindow, floatingWindow.querySelector(".pilot-header"));
         makeResizable(floatingWindow);
-
-        // Add toggle button to ComfyUI menu
         addMenuButton(floatingWindow);
-
-        // Add context menu option
+        addActionbarReopenButton();
         addContextMenuOption();
-
-        // Start workflow sync
+        renderWorkspace();
+        applySavedWindowVisibility();
         startWorkflowSync();
 
-        console.log("Claude Code extension loaded");
+        console.log("Comfy Pilot extension loaded");
     },
 });
 
+async function handleDefaultCliSettingChange(value) {
+    if (!value || workspace.settings.default_cli === value) {
+        return;
+    }
+    await syncBackendSettings({ default_cli: value });
+    await refreshCliInventory();
+    if (floatingWindow) {
+        renderWorkspace();
+    }
+}
+
+async function handleShowUnavailableSettingChange(value) {
+    const boolValue = Boolean(value);
+    if (workspace.settings.show_unavailable === boolValue) {
+        return;
+    }
+    await syncBackendSettings({ show_unavailable: boolValue });
+    await refreshCliInventory();
+    if (floatingWindow) {
+        renderWorkspace();
+    }
+}
+
+function getSettingsApi() {
+    return app.extensionManager?.setting;
+}
+
+function getExtensionSetting(id, fallbackValue) {
+    const settingsApi = getSettingsApi();
+    if (!settingsApi?.get) {
+        return fallbackValue;
+    }
+    const value = settingsApi.get(id);
+    return value === undefined || value === null ? fallbackValue : value;
+}
+
 async function loadXtermDependencies() {
-    // Load xterm.js CSS
     const xtermCss = document.createElement("link");
     xtermCss.rel = "stylesheet";
     xtermCss.href = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css";
     document.head.appendChild(xtermCss);
 
-    // Load xterm.js
     await loadScript("https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js");
-
-    // Load xterm-addon-fit
     await loadScript("https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js");
-
-    // Load xterm-addon-canvas for rendering (faster than DOM, more stable than WebGL)
     await loadScript("https://cdn.jsdelivr.net/npm/xterm-addon-canvas@0.5.0/lib/xterm-addon-canvas.min.js");
-
-    // Load xterm-addon-unicode11 for proper unicode character width handling
     await loadScript("https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/lib/xterm-addon-unicode11.min.js");
 }
 
@@ -69,48 +134,202 @@ function loadScript(src) {
     });
 }
 
+async function fetchJson(url, options = {}) {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+        throw new Error(`Request failed: ${response.status}`);
+    }
+    return response.json();
+}
+
+function shouldShowFloatingWindow() {
+    return !workspace.settings.window_closed;
+}
+
+function updateWindowVisibility(visible, { persist = true, focusTerminal = true } = {}) {
+    workspace.settings.window_closed = !visible;
+
+    if (floatingWindow) {
+        floatingWindow.style.display = visible ? "flex" : "none";
+    }
+
+    updateActionbarButtonVisibility();
+
+    if (visible && focusTerminal) {
+        setTimeout(() => {
+            fitAllTerminals();
+            const activeState = workspace.terminalStates.get(workspace.activeAdapterId);
+            activeState?.terminal?.focus();
+        }, 100);
+    }
+
+    if (persist) {
+        void persistWindowClosedState();
+    }
+}
+
+function openFloatingWindow({ persist = true, focusTerminal = true } = {}) {
+    updateWindowVisibility(true, { persist, focusTerminal });
+}
+
+function closeFloatingWindow({ persist = true } = {}) {
+    updateWindowVisibility(false, { persist, focusTerminal: false });
+}
+
+function applySavedWindowVisibility() {
+    updateWindowVisibility(shouldShowFloatingWindow(), { persist: false, focusTerminal: false });
+}
+
+async function persistWindowClosedState() {
+    try {
+        await syncBackendSettings({ window_closed: workspace.settings.window_closed });
+    } catch (error) {
+        console.warn("Failed to persist Comfy Pilot window state:", error);
+    }
+}
+
+async function syncBackendSettings(patch) {
+    const data = await fetchJson(`${API_BASE}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+    });
+    workspace.settings = {
+        ...workspace.settings,
+        ...data,
+    };
+    return data;
+}
+
+async function refreshCliInventory() {
+    try {
+        const inventory = await fetchJson(`${API_BASE}/clis`);
+        workspace.settings = {
+            ...workspace.settings,
+            default_cli: inventory.default_cli ?? workspace.settings.default_cli,
+            enabled_clis: inventory.enabled_clis ?? workspace.settings.enabled_clis,
+            show_unavailable: inventory.show_unavailable ?? workspace.settings.show_unavailable,
+            window_closed: inventory.window_closed ?? workspace.settings.window_closed,
+        };
+        workspace.adapters = inventory.adapters || [];
+        return inventory;
+    } catch (error) {
+        console.warn("Failed to fetch CLI inventory:", error);
+        return null;
+    }
+}
+
+async function initializeWorkspaceConfig() {
+    workspace.settings.default_cli = getExtensionSetting(DEFAULT_CLI_SETTING_ID, workspace.settings.default_cli);
+    workspace.settings.show_unavailable = Boolean(
+        getExtensionSetting(SHOW_UNAVAILABLE_SETTING_ID, workspace.settings.show_unavailable),
+    );
+
+    try {
+        await syncBackendSettings({
+            default_cli: workspace.settings.default_cli,
+            show_unavailable: workspace.settings.show_unavailable,
+        });
+    } catch (error) {
+        console.warn("Failed to persist Comfy Pilot settings:", error);
+    }
+
+    await refreshCliInventory();
+}
 
 function createFloatingWindow() {
+    ensureStyles();
+
     const container = document.createElement("div");
-    container.id = "claude-code-window";
+    container.id = "comfy-pilot-window";
 
     container.innerHTML = `
-        <div class="claude-resize-edge claude-resize-n"></div>
-        <div class="claude-resize-edge claude-resize-s"></div>
-        <div class="claude-resize-edge claude-resize-e"></div>
-        <div class="claude-resize-edge claude-resize-w"></div>
-        <div class="claude-resize-corner claude-resize-nw"></div>
-        <div class="claude-resize-corner claude-resize-ne"></div>
-        <div class="claude-resize-corner claude-resize-sw"></div>
-        <div class="claude-resize-corner claude-resize-se"></div>
-        <div class="claude-header">
-            <div class="claude-title-area">
-                <span class="claude-title">Claude Code</span>
-                <div class="claude-mcp-status" title="MCP Server Status">
+        <div class="pilot-resize-edge pilot-resize-n"></div>
+        <div class="pilot-resize-edge pilot-resize-s"></div>
+        <div class="pilot-resize-edge pilot-resize-e"></div>
+        <div class="pilot-resize-edge pilot-resize-w"></div>
+        <div class="pilot-resize-corner pilot-resize-nw"></div>
+        <div class="pilot-resize-corner pilot-resize-ne"></div>
+        <div class="pilot-resize-corner pilot-resize-sw"></div>
+        <div class="pilot-resize-corner pilot-resize-se"></div>
+        <div class="pilot-header">
+            <div class="pilot-title-area">
+                <span class="pilot-title">Comfy Pilot</span>
+                <span class="pilot-active-cli">Loading...</span>
+                <div class="pilot-mcp-status" title="MCP status">
                     <span class="mcp-indicator"></span>
                     <span class="mcp-label">MCP</span>
                 </div>
             </div>
-            <div class="claude-controls">
-                <button class="claude-btn claude-reload" title="Reload Terminal">↻</button>
-                <button class="claude-btn claude-minimize" title="Minimize">−</button>
-                <button class="claude-btn claude-close" title="Close">×</button>
+            <div class="pilot-controls">
+                <button class="pilot-btn pilot-reload" title="Reload active terminal">↻</button>
+                <button class="pilot-btn pilot-minimize" title="Minimize">−</button>
+                <button class="pilot-btn pilot-close" title="Close">×</button>
             </div>
         </div>
-        <div class="claude-content">
-            <div class="claude-terminal" id="claude-terminal"></div>
+        <div class="pilot-content">
+            <div class="pilot-tabs"></div>
+            <div class="pilot-panes"></div>
         </div>
     `;
 
-    // Apply styles
+    setTimeout(() => {
+        container.querySelector(".pilot-close").addEventListener("click", () => {
+            closeFloatingWindow();
+        });
+
+        container.querySelector(".pilot-reload").addEventListener("click", () => {
+            reloadActiveTerminal();
+        });
+
+        const minimizeBtn = container.querySelector(".pilot-minimize");
+        let savedWidth = null;
+        let savedRight = null;
+        minimizeBtn.addEventListener("click", () => {
+            const isMinimized = container.classList.toggle("minimized");
+            minimizeBtn.textContent = isMinimized ? "+" : "−";
+            minimizeBtn.title = isMinimized ? "Expand" : "Minimize";
+
+            if (isMinimized) {
+                savedWidth = container.offsetWidth;
+                const rect = container.getBoundingClientRect();
+                savedRight = window.innerWidth - rect.right;
+                container.style.left = "auto";
+                container.style.right = `${savedRight}px`;
+                container.classList.add("collapsed-width");
+            } else {
+                container.classList.remove("collapsed-width");
+                if (savedWidth) {
+                    container.style.width = `${savedWidth}px`;
+                }
+                setTimeout(() => {
+                    fitAllTerminals();
+                }, 50);
+            }
+        });
+
+        container.querySelector(".pilot-mcp-status").addEventListener("click", () => {
+            void checkMcpStatus();
+        });
+    }, 0);
+
+    return container;
+}
+
+function ensureStyles() {
+    if (document.getElementById("comfy-pilot-styles")) {
+        return;
+    }
+
     const style = document.createElement("style");
+    style.id = "comfy-pilot-styles";
     style.textContent = `
-        #claude-code-window {
+        #comfy-pilot-window {
             position: fixed;
             top: 100px;
             right: 20px;
-            width: 950px;
-            height: 600px;
+            width: 980px;
+            height: 620px;
             background-color: #0d0d0d;
             border: 1px solid #333;
             border-radius: 8px;
@@ -126,7 +345,7 @@ function createFloatingWindow() {
             flex-direction: column;
         }
 
-        .claude-header {
+        .pilot-header {
             cursor: move;
             background: #1a1a1a;
             padding: 8px 12px;
@@ -138,19 +357,24 @@ function createFloatingWindow() {
             flex-shrink: 0;
         }
 
-        .claude-title-area {
+        .pilot-title-area {
             display: flex;
             align-items: center;
             gap: 12px;
         }
 
-        .claude-title {
+        .pilot-title {
             font-weight: 600;
             font-size: 13px;
-            color: #aaa;
+            color: #d1d5db;
         }
 
-        .claude-mcp-status {
+        .pilot-active-cli {
+            font-size: 12px;
+            color: #93c5fd;
+        }
+
+        .pilot-mcp-status {
             display: flex;
             align-items: center;
             gap: 5px;
@@ -161,7 +385,7 @@ function createFloatingWindow() {
             transition: background 0.15s;
         }
 
-        .claude-mcp-status:hover {
+        .pilot-mcp-status:hover {
             background: rgba(255, 255, 255, 0.1);
         }
 
@@ -184,10 +408,10 @@ function createFloatingWindow() {
 
         .mcp-indicator.checking {
             background: #fbbf24;
-            animation: pulse 1s infinite;
+            animation: pilot-pulse 1s infinite;
         }
 
-        @keyframes pulse {
+        @keyframes pilot-pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
@@ -198,12 +422,12 @@ function createFloatingWindow() {
             font-weight: 500;
         }
 
-        .claude-controls {
+        .pilot-controls {
             display: flex;
             gap: 4px;
         }
 
-        .claude-btn {
+        .pilot-btn {
             background: transparent;
             border: none;
             color: #666;
@@ -219,55 +443,55 @@ function createFloatingWindow() {
             justify-content: center;
         }
 
-        .claude-btn:hover {
+        .pilot-btn:hover {
             background: rgba(255, 255, 255, 0.1);
             color: #fff;
         }
 
-        .claude-close:hover {
+        .pilot-close:hover {
             background: #e74c3c;
             color: #fff;
         }
 
-        .claude-reload:hover {
+        .pilot-reload:hover {
             background: #27ae60;
             color: #fff;
         }
 
-        .claude-minimize:hover {
+        .pilot-minimize:hover {
             background: #f39c12;
             color: #fff;
         }
 
-        /* Minimized state */
-        #claude-code-window.minimized {
+        #comfy-pilot-window.minimized {
             height: auto !important;
             min-height: 0 !important;
         }
 
-        #claude-code-window.minimized.collapsed-width {
+        #comfy-pilot-window.minimized.collapsed-width {
             width: auto !important;
             min-width: 0 !important;
         }
 
-        #claude-code-window.minimized .claude-content {
+        #comfy-pilot-window.minimized .pilot-content {
             display: none;
         }
 
-        #claude-code-window.minimized .claude-resize-edge,
-        #claude-code-window.minimized .claude-resize-corner {
+        #comfy-pilot-window.minimized .pilot-resize-edge,
+        #comfy-pilot-window.minimized .pilot-resize-corner {
             display: none;
         }
 
-        #claude-code-window.minimized .claude-header {
+        #comfy-pilot-window.minimized .pilot-header {
             padding: 8px 10px;
         }
 
-        #claude-code-window.minimized .mcp-label {
+        #comfy-pilot-window.minimized .mcp-label,
+        #comfy-pilot-window.minimized .pilot-active-cli {
             display: none;
         }
 
-        .claude-content {
+        .pilot-content {
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -275,27 +499,140 @@ function createFloatingWindow() {
             position: relative;
         }
 
-        .claude-terminal {
+        .pilot-tabs {
+            display: flex;
+            gap: 6px;
+            padding: 10px 10px 0;
+            border-bottom: 1px solid #222;
+            background: #101010;
+            flex-shrink: 0;
+        }
+
+        .pilot-tab {
+            border: 1px solid #2c2c2c;
+            background: #161616;
+            color: #a3a3a3;
+            border-radius: 8px 8px 0 0;
+            padding: 8px 12px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            max-width: 240px;
+        }
+
+        .pilot-tab.active {
+            background: #1f2937;
+            color: #fff;
+            border-color: #3b82f6;
+        }
+
+        .pilot-tab.unavailable {
+            opacity: 0.6;
+        }
+
+        .pilot-tab-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+            flex-shrink: 0;
+        }
+
+        .pilot-tab-status.connected {
+            background: #4ade80;
+        }
+
+        .pilot-tab-status.connecting {
+            background: #fbbf24;
+        }
+
+        .pilot-tab-status.disconnected {
+            background: #f87171;
+        }
+
+        .pilot-tab-status.unavailable {
+            background: #666;
+        }
+
+        .pilot-tab-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .pilot-panes {
+            position: relative;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .pilot-pane {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            visibility: hidden;
+            pointer-events: none;
+        }
+
+        .pilot-pane.active {
+            visibility: visible;
+            pointer-events: auto;
+        }
+
+        .pilot-terminal-host {
             flex: 1;
             padding: 4px;
             overflow: hidden;
         }
 
-        .claude-terminal .xterm {
+        .pilot-terminal-host .xterm {
             height: 100%;
         }
 
-        .claude-terminal .xterm-viewport {
+        .pilot-terminal-host .xterm-viewport {
             overflow-y: auto !important;
         }
 
-        /* Resize edges */
-        .claude-resize-edge {
+        .pilot-empty-state {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #9ca3af;
+            padding: 24px;
+            text-align: center;
+            background: #0f0f0f;
+        }
+
+        .pilot-unavailable-card {
+            margin: 16px;
+            padding: 16px;
+            border: 1px solid #2c2c2c;
+            border-radius: 8px;
+            background: #111827;
+            color: #d1d5db;
+            max-width: 560px;
+        }
+
+        .pilot-unavailable-card h3 {
+            margin: 0 0 8px;
+            font-size: 15px;
+        }
+
+        .pilot-unavailable-card p {
+            margin: 0;
+            color: #9ca3af;
+        }
+
+        .pilot-resize-edge {
             position: absolute;
             z-index: 10;
         }
 
-        .claude-resize-n {
+        .pilot-resize-n {
             top: 0;
             left: 8px;
             right: 8px;
@@ -303,7 +640,7 @@ function createFloatingWindow() {
             cursor: ns-resize;
         }
 
-        .claude-resize-s {
+        .pilot-resize-s {
             bottom: 0;
             left: 8px;
             right: 8px;
@@ -311,7 +648,7 @@ function createFloatingWindow() {
             cursor: ns-resize;
         }
 
-        .claude-resize-e {
+        .pilot-resize-e {
             right: 0;
             top: 8px;
             bottom: 8px;
@@ -319,7 +656,7 @@ function createFloatingWindow() {
             cursor: ew-resize;
         }
 
-        .claude-resize-w {
+        .pilot-resize-w {
             left: 0;
             top: 8px;
             bottom: 8px;
@@ -327,39 +664,38 @@ function createFloatingWindow() {
             cursor: ew-resize;
         }
 
-        /* Resize corners */
-        .claude-resize-corner {
+        .pilot-resize-corner {
             position: absolute;
             width: 12px;
             height: 12px;
             z-index: 11;
         }
 
-        .claude-resize-nw {
+        .pilot-resize-nw {
             top: 0;
             left: 0;
             cursor: nwse-resize;
         }
 
-        .claude-resize-ne {
+        .pilot-resize-ne {
             top: 0;
             right: 0;
             cursor: nesw-resize;
         }
 
-        .claude-resize-sw {
+        .pilot-resize-sw {
             bottom: 0;
             left: 0;
             cursor: nesw-resize;
         }
 
-        .claude-resize-se {
+        .pilot-resize-se {
             bottom: 0;
             right: 0;
             cursor: nwse-resize;
         }
 
-        #claude-menu-btn {
+        #comfy-pilot-menu-btn {
             background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
             border: none;
             color: white;
@@ -371,77 +707,316 @@ function createFloatingWindow() {
             margin-left: 8px;
         }
 
-        #claude-menu-btn:hover {
+        #comfy-pilot-menu-btn:hover {
             background: linear-gradient(135deg, #7c7ff2 0%, #6366f1 100%);
+        }
+
+        .comfy-pilot-actionbar-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.92);
+            color: #e5e7eb;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, transform 0.15s;
+        }
+
+        .comfy-pilot-actionbar-btn:hover {
+            background: rgba(30, 41, 59, 0.98);
+            border-color: rgba(96, 165, 250, 0.7);
+            transform: translateY(-1px);
+        }
+
+        .comfy-pilot-actionbar-btn svg {
+            width: 18px;
+            height: 18px;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 1.7;
+            stroke-linecap: round;
+            stroke-linejoin: round;
         }
     `;
     document.head.appendChild(style);
-
-    // Event listeners
-    setTimeout(() => {
-        // Close button
-        container.querySelector(".claude-close").addEventListener("click", () => {
-            container.style.display = "none";
-        });
-
-        // Reload button - fully reloads terminal
-        container.querySelector(".claude-reload").addEventListener("click", () => {
-            reloadTerminal();
-        });
-
-        // Minimize button - toggle minimized state
-        const minimizeBtn = container.querySelector(".claude-minimize");
-        let savedWidth = null;
-        let savedRight = null;
-        minimizeBtn.addEventListener("click", () => {
-            const isMinimized = container.classList.toggle("minimized");
-            minimizeBtn.textContent = isMinimized ? "+" : "−";
-            minimizeBtn.title = isMinimized ? "Expand" : "Minimize";
-
-            if (isMinimized) {
-                // Save current width and right edge position
-                savedWidth = container.offsetWidth;
-                const rect = container.getBoundingClientRect();
-                savedRight = window.innerWidth - rect.right;
-
-                // Switch to right-anchored positioning
-                container.style.left = "auto";
-                container.style.right = savedRight + "px";
-                container.classList.add("collapsed-width");
-            } else {
-                // Remove collapsed class and restore saved width
-                container.classList.remove("collapsed-width");
-                if (savedWidth) {
-                    container.style.width = savedWidth + "px";
-                }
-                // Refit terminal when expanding
-                if (fitAddon && terminal) {
-                    setTimeout(() => {
-                        window.fitTerminalPreserveScroll();
-                    }, 50);
-                }
-            }
-        });
-
-        // MCP status indicator - click to check status
-        container.querySelector(".claude-mcp-status").addEventListener("click", () => {
-            checkMcpStatus();
-        });
-
-        // Initialize terminal
-        initTerminal(container.querySelector("#claude-terminal"));
-
-        // Start MCP status checking
-        checkMcpStatus();
-        // MCP status only checked on click, no polling
-    }, 0);
-
-    return container;
 }
 
-function initTerminal(terminalContainer) {
-    // Create xterm.js terminal
-    terminal = new Terminal({
+function createActionbarReopenButton() {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "comfy-pilot-actionbar-btn";
+    button.title = "Reopen Comfy Pilot terminal";
+    button.setAttribute("aria-label", "Reopen Comfy Pilot terminal");
+    button.innerHTML = `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="3" y="5" width="18" height="14" rx="2"></rect>
+            <path d="M7.5 10 10.5 12 7.5 14"></path>
+            <path d="M13 14h4"></path>
+        </svg>
+    `;
+    button.addEventListener("click", () => {
+        openFloatingWindow();
+    });
+    return button;
+}
+
+function ensureActionbarReopenButton() {
+    const container = document.querySelector(".actionbar-container");
+    if (!container) {
+        return null;
+    }
+
+    if (!actionbarReopenButton) {
+        actionbarReopenButton = createActionbarReopenButton();
+    }
+
+    if (actionbarReopenButton.parentElement !== container) {
+        container.appendChild(actionbarReopenButton);
+    }
+
+    return actionbarReopenButton;
+}
+
+function updateActionbarButtonVisibility() {
+    const button = ensureActionbarReopenButton();
+    if (!button) {
+        return;
+    }
+    button.style.display = workspace.settings.window_closed ? "inline-flex" : "none";
+}
+
+function addActionbarReopenButton() {
+    if (ensureActionbarReopenButton()) {
+        updateActionbarButtonVisibility();
+        return;
+    }
+
+    const checkActionbar = setInterval(() => {
+        if (ensureActionbarReopenButton()) {
+            updateActionbarButtonVisibility();
+            clearInterval(checkActionbar);
+        }
+    }, 500);
+
+    setTimeout(() => clearInterval(checkActionbar), 10000);
+}
+
+function getVisibleAdapters() {
+    return workspace.adapters.filter((adapter) => {
+        if (!workspace.settings.enabled_clis.includes(adapter.id)) {
+            return false;
+        }
+        return isTerminalUsable(adapter) || workspace.settings.show_unavailable;
+    });
+}
+
+function isTerminalUsable(adapter) {
+    if (typeof adapter.terminal_usable === "boolean") {
+        return adapter.terminal_usable;
+    }
+    return Boolean(adapter.available && adapter.terminal_supported !== false);
+}
+
+function getAdapterUnavailableHeading(adapter) {
+    if (!adapter.available) {
+        return `${adapter.label} is not installed`;
+    }
+    if (adapter.terminal_supported === false) {
+        return `${adapter.label} terminal is unavailable on this platform`;
+    }
+    return `${adapter.label} is unavailable`;
+}
+
+function getAdapterUnavailableReason(adapter) {
+    if (adapter.unavailable_reason) {
+        return adapter.unavailable_reason;
+    }
+    if (!adapter.available) {
+        return adapter.install_hint || `Install ${adapter.label} to use it in Comfy Pilot.`;
+    }
+    if (adapter.terminal_supported === false) {
+        return (
+            `${adapter.label} is installed, but embedded terminals are not supported on this platform. ` +
+            "Use the CLI directly and keep Comfy Pilot's REST/MCP integration."
+        );
+    }
+    return `${adapter.label} is unavailable.`;
+}
+
+function resolveActiveAdapterId(visibleAdapters) {
+    if (!visibleAdapters.length) {
+        return null;
+    }
+
+    const preferred = workspace.settings.default_cli;
+    if (visibleAdapters.some((adapter) => adapter.id === preferred)) {
+        return preferred;
+    }
+
+    const available = visibleAdapters.find((adapter) => isTerminalUsable(adapter));
+    return available ? available.id : visibleAdapters[0].id;
+}
+
+function renderWorkspace() {
+    if (!floatingWindow) {
+        return;
+    }
+
+    const tabsContainer = floatingWindow.querySelector(".pilot-tabs");
+    const panesContainer = floatingWindow.querySelector(".pilot-panes");
+    tabsContainer.innerHTML = "";
+    panesContainer.innerHTML = "";
+
+    const visibleAdapters = getVisibleAdapters();
+    if (!visibleAdapters.length) {
+        panesContainer.innerHTML = `
+            <div class="pilot-empty-state">
+                No usable CLI terminal tabs are available. Install a supported CLI, use a terminal-supported
+                platform for embedded terminals, or enable unavailable tabs in settings.
+            </div>
+        `;
+        workspace.activeAdapterId = null;
+        updateActiveCliLabel();
+        void checkMcpStatus();
+        return;
+    }
+
+    visibleAdapters.forEach((adapter) => {
+        const state = ensureTerminalState(adapter);
+        state.adapter = adapter;
+        const terminalUsable = isTerminalUsable(adapter);
+        const unavailableReason = getAdapterUnavailableReason(adapter);
+        const unavailableHeading = getAdapterUnavailableHeading(adapter);
+
+        const tab = document.createElement("button");
+        tab.className = `pilot-tab${terminalUsable ? "" : " unavailable"}`;
+        tab.dataset.adapterId = adapter.id;
+        tab.innerHTML = `
+            <span class="pilot-tab-status ${terminalUsable ? state.status || "connecting" : "unavailable"}"></span>
+            <span class="pilot-tab-label">${adapter.label}</span>
+        `;
+        tab.title = terminalUsable ? adapter.label : unavailableReason;
+        tab.addEventListener("click", () => {
+            selectAdapterTab(adapter.id);
+        });
+        tabsContainer.appendChild(tab);
+        state.tabButton = tab;
+
+        const pane = document.createElement("div");
+        pane.className = "pilot-pane";
+        pane.dataset.adapterId = adapter.id;
+        panesContainer.appendChild(pane);
+        state.pane = pane;
+
+        if (terminalUsable) {
+            pane.appendChild(state.host);
+            if (!state.initialized) {
+                initTerminalState(state);
+            } else {
+                requestAnimationFrame(() => fitTerminalState(state));
+            }
+        } else {
+            pane.innerHTML = `
+                <div class="pilot-empty-state">
+                    <div class="pilot-unavailable-card">
+                        <h3>${unavailableHeading}</h3>
+                        <p>${unavailableReason}</p>
+                    </div>
+                </div>
+            `;
+            state.status = "unavailable";
+            state.statusMessage = unavailableReason;
+        }
+
+        updateTabStatus(state);
+    });
+
+    workspace.activeAdapterId = resolveActiveAdapterId(visibleAdapters);
+    selectAdapterTab(workspace.activeAdapterId);
+}
+
+function ensureTerminalState(adapter) {
+    let state = workspace.terminalStates.get(adapter.id);
+    if (!state) {
+        const host = document.createElement("div");
+        host.className = "pilot-terminal-host";
+        state = {
+            adapter,
+            host,
+            pane: null,
+            tabButton: null,
+            terminal: null,
+            fitAddon: null,
+            websocket: null,
+            initialized: false,
+            status: isTerminalUsable(adapter) ? "connecting" : "unavailable",
+            statusMessage: "",
+            capabilityError: false,
+        };
+        workspace.terminalStates.set(adapter.id, state);
+    }
+    return state;
+}
+
+function updateActiveCliLabel() {
+    if (!floatingWindow) {
+        return;
+    }
+    const label = floatingWindow.querySelector(".pilot-active-cli");
+    if (!label) {
+        return;
+    }
+    const activeState = workspace.terminalStates.get(workspace.activeAdapterId);
+    label.textContent = activeState?.adapter?.label || "No active CLI";
+}
+
+function updateTabStatus(state) {
+    if (!state.tabButton) {
+        return;
+    }
+    const dot = state.tabButton.querySelector(".pilot-tab-status");
+    if (dot) {
+        dot.className = `pilot-tab-status ${state.status || "disconnected"}`;
+    }
+    if (state.statusMessage) {
+        state.tabButton.title = `${state.adapter.label}: ${state.statusMessage}`;
+    }
+}
+
+function setStateStatus(state, status, message = "") {
+    state.status = status;
+    state.statusMessage = message;
+    updateTabStatus(state);
+}
+
+function selectAdapterTab(adapterId) {
+    workspace.activeAdapterId = adapterId;
+    updateActiveCliLabel();
+
+    for (const state of workspace.terminalStates.values()) {
+        if (state.tabButton) {
+            state.tabButton.classList.toggle("active", state.adapter.id === adapterId);
+        }
+        if (state.pane) {
+            state.pane.classList.toggle("active", state.adapter.id === adapterId);
+        }
+    }
+
+    const activeState = workspace.terminalStates.get(adapterId);
+    if (activeState?.terminal) {
+        setTimeout(() => {
+            fitTerminalState(activeState);
+            activeState.terminal.focus();
+        }, 50);
+    }
+    void checkMcpStatus();
+}
+
+function createTerminalOptions() {
+    return {
         cursorBlink: true,
         cursorStyle: "block",
         fontSize: 13,
@@ -473,162 +1048,106 @@ function initTerminal(terminalContainer) {
         scrollback: 1000,
         smoothScrollDuration: 0,
         fastScrollModifier: "none",
-        scrollOnUserInput: true,  // Only scroll when user types, not on focus
-    });
+        scrollOnUserInput: true,
+    };
+}
 
-    // Load fit addon
-    fitAddon = new FitAddon.FitAddon();
+function initTerminalState(state) {
+    const terminal = new Terminal(createTerminalOptions());
+    const fitAddon = new FitAddon.FitAddon();
     terminal.loadAddon(fitAddon);
 
-    // Helper to fit terminal while preserving scroll position
-    // (fitAddon.fit() can reset scroll position)
-    window.fitTerminalPreserveScroll = function() {
-        if (!fitAddon || !terminal) return;
-
-        // Check if user is scrolled to bottom (following output)
-        const buffer = terminal.buffer.active;
-        const isAtBottom = buffer.viewportY >= buffer.baseY;
-
-        // Get current scroll position
-        const viewport = document.querySelector(".xterm-viewport");
-        const scrollTop = viewport ? viewport.scrollTop : 0;
-
-        // Do the fit
-        fitAddon.fit();
-
-        // Restore scroll position only if user wasn't at bottom
-        // (if at bottom, let it stay at bottom to follow new output)
-        if (!isAtBottom && viewport) {
-            viewport.scrollTop = scrollTop;
-        }
-    };
-
-    // Load unicode11 addon for proper character width handling (box drawing, CJK, etc.)
     try {
         const unicode11Addon = new Unicode11Addon.Unicode11Addon();
         terminal.loadAddon(unicode11Addon);
         terminal.unicode.activeVersion = "11";
-        console.log("Unicode11 addon loaded");
-    } catch (e) {
-        console.log("Unicode11 addon not available:", e.message);
+    } catch (error) {
+        console.log("Unicode11 addon not available:", error.message);
     }
 
-    // Use Canvas renderer (faster than DOM, more stable than WebGL)
     try {
         terminal.loadAddon(new CanvasAddon.CanvasAddon());
-        console.log("Using Canvas renderer");
-    } catch (e) {
-        console.log("Canvas addon not available, using DOM renderer:", e.message);
+    } catch (error) {
+        console.log("Canvas addon not available, using DOM renderer:", error.message);
     }
 
-    // Open terminal in container
-    terminal.open(terminalContainer);
+    terminal.open(state.host);
+    state.terminal = terminal;
+    state.fitAddon = fitAddon;
+    state.initialized = true;
 
-    // Fit to container after a short delay
-    setTimeout(() => {
-        fitAddon.fit();
-    }, 100);
-
-    // Handle terminal input - use minimal protocol for speed
     terminal.onData((data) => {
-        if (websocket && websocket.readyState === WebSocket.OPEN) {
-            // Fast path: 'i' prefix + data (no JSON overhead)
-            websocket.send(JSON.stringify({ type: "i", d: data }));
+        if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+            state.websocket.send(JSON.stringify({ type: "i", d: data }));
         }
     });
 
-    // Handle special keyboard shortcuts for macOS-style editing
     terminal.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") return true;
 
-        const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
+        const isMac = navigator.platform.toUpperCase().includes("MAC");
         const modKey = isMac ? event.metaKey : event.ctrlKey;
         const altKey = event.altKey;
 
-        // Helper to send escape sequence
         const send = (data) => {
-            if (websocket && websocket.readyState === WebSocket.OPEN) {
-                websocket.send(JSON.stringify({ type: "i", d: data }));
+            if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+                state.websocket.send(JSON.stringify({ type: "i", d: data }));
             }
         };
 
-        // Shift+Enter: insert a literal newline (for multi-line input in Claude)
-        // Send ESC + Enter sequence that terminals like iTerm2/WezTerm use for Shift+Enter
-        // This is recognized by Claude Code as multiline input (not submit)
         if (event.key === "Enter" && event.shiftKey) {
-            send("\x1b\r"); // ESC + CR - common terminal escape for Shift+Enter
+            send("\x1b\r");
             return false;
         }
-
-        // Option/Alt + Left Arrow: move word left (send ESC-b)
         if (altKey && event.key === "ArrowLeft") {
             send("\x1bb");
             return false;
         }
-
-        // Option/Alt + Right Arrow: move word right (send ESC-f)
         if (altKey && event.key === "ArrowRight") {
             send("\x1bf");
-        return false;
+            return false;
         }
-
-        // Cmd/Ctrl + Left Arrow: move to beginning of line (send Ctrl-A)
         if (modKey && event.key === "ArrowLeft") {
             send("\x01");
             return false;
         }
-
-        // Cmd/Ctrl + Right Arrow: move to end of line (send Ctrl-E)
         if (modKey && event.key === "ArrowRight") {
             send("\x05");
             return false;
         }
-
-        // Option/Alt + Backspace: delete word backward (send ESC-DEL or Ctrl-W)
         if (altKey && event.key === "Backspace") {
-            send("\x17"); // Ctrl-W (unix-word-rubout)
+            send("\x17");
             return false;
         }
-
-        // Cmd/Ctrl + Backspace: delete to beginning of line (send Ctrl-U)
         if (modKey && event.key === "Backspace") {
-            send("\x15"); // Ctrl-U (kill line backward)
+            send("\x15");
             return false;
         }
-
-        // Option/Alt + Delete: delete word forward (send ESC-d)
         if (altKey && event.key === "Delete") {
             send("\x1bd");
             return false;
         }
-
-        // Cmd/Ctrl + Delete: delete to end of line (send Ctrl-K)
         if (modKey && event.key === "Delete") {
-            send("\x0b"); // Ctrl-K (kill line forward)
+            send("\x0b");
             return false;
         }
 
-        return true; // Allow all other keys
+        return true;
     });
 
-    // Handle terminal resize
     terminal.onResize(({ rows, cols }) => {
-        if (websocket && websocket.readyState === WebSocket.OPEN) {
-            websocket.send(JSON.stringify({ type: "resize", rows, cols }));
+        if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+            state.websocket.send(JSON.stringify({ type: "resize", rows, cols }));
         }
     });
 
-    // Preserve scroll position on blur (clicking outside terminal)
-    // xterm's internal textarea can cause scroll resets on blur
     setTimeout(() => {
-        const viewport = terminalContainer.querySelector(".xterm-viewport");
+        const viewport = state.host.querySelector(".xterm-viewport");
         const textarea = terminal.textarea;
         if (viewport && textarea) {
             let savedScrollTop = null;
-
             textarea.addEventListener("blur", () => {
                 savedScrollTop = viewport.scrollTop;
-                // Restore after any internal xterm processing
                 requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
                         if (savedScrollTop !== null && viewport.scrollTop !== savedScrollTop) {
@@ -640,146 +1159,168 @@ function initTerminal(terminalContainer) {
         }
     }, 200);
 
-    // Connect to WebSocket
-    connectWebSocket();
+    setTimeout(() => fitTerminalState(state), 100);
+    connectWebSocket(state);
 }
 
-function reloadTerminal() {
-    // Close existing connection
-    if (websocket) {
-        websocket.close();
+function fitTerminalState(state) {
+    if (!state?.terminal || !state?.fitAddon) {
+        return;
     }
 
-    // Clear terminal
-    if (terminal) {
-        terminal.clear();
-        terminal.writeln("\x1b[1;34mReloading terminal...\x1b[0m\n");
-    }
+    const buffer = state.terminal.buffer.active;
+    const viewport = state.host.querySelector(".xterm-viewport");
+    const isAtBottom = buffer.viewportY >= buffer.baseY;
+    const scrollTop = viewport ? viewport.scrollTop : 0;
 
-    // Reconnect
-    setTimeout(() => {
-        connectWebSocket();
-    }, 100);
+    state.fitAddon.fit();
+
+    if (!isAtBottom && viewport) {
+        viewport.scrollTop = scrollTop;
+    }
 }
 
-function connectWebSocket() {
-    // Close existing connection
-    if (websocket) {
-        websocket.close();
+function fitAllTerminals() {
+    for (const state of workspace.terminalStates.values()) {
+        if (state.initialized) {
+            fitTerminalState(state);
+        }
     }
+}
 
-    // Determine WebSocket URL
+function buildWebSocketUrl(adapterId) {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws/claude-terminal`;
+    const query = new URLSearchParams({
+        adapter: adapterId,
+        session: workspace.windowSessionId,
+    });
+    return `${protocol}//${window.location.host}${WS_PATH}?${query.toString()}`;
+}
 
-    console.log(`[Claude Code] Connecting to ${wsUrl}`);
-
-    try {
-        websocket = new WebSocket(wsUrl);
-
-        websocket.onopen = () => {
-            console.log("[Claude Code] WebSocket connected");
-
-            // Clear terminal first
-            terminal.clear();
-
-            // Send initial size immediately
-            if (terminal && fitAddon) {
-                fitAddon.fit();
-                const sendSize = () => {
-                    const dims = fitAddon.proposeDimensions();
-                    if (dims && websocket && websocket.readyState === WebSocket.OPEN) {
-                        websocket.send(JSON.stringify({ type: "resize", rows: dims.rows, cols: dims.cols }));
-                    }
-                };
-
-                // Send size immediately
-                sendSize();
-
-                // Send resize multiple times after claude has started to force proper rendering
-                // Claude needs SIGWINCH to redraw properly
-                setTimeout(sendSize, 300);
-                setTimeout(sendSize, 800);
-                setTimeout(sendSize, 1500);
-            }
-        };
-
-        websocket.onmessage = (event) => {
-            const data = event.data;
-            // Fast path: 'o' prefix means raw output (no JSON)
-            if (data[0] === 'o') {
-                const output = data.slice(1);
-                // Filter out focus tracking sequences that can cause issues
-                const filteredData = output.replace(/\x1b\[\[?[IO]/g, "");
-                if (filteredData) {
-                    terminal.write(filteredData);
-                }
-                return;
-            }
-            // Legacy JSON format
-            try {
-                const msg = JSON.parse(data);
-                if (msg.type === "output" && msg.data) {
-                    const filteredData = msg.data.replace(/\x1b\[\[?[IO]/g, "");
-                    if (filteredData) {
-                        terminal.write(filteredData);
-                    }
-                }
-            } catch (e) {
-                // Unknown format, ignore
-            }
-        };
-
-        websocket.onclose = (event) => {
-            console.log("[Claude Code] WebSocket closed:", event.code, event.reason);
-            terminal.writeln("\n\x1b[1;31mTerminal disconnected.\x1b[0m");
-            terminal.writeln("Click ↻ to reload.\n");
-        };
-
-        websocket.onerror = (error) => {
-            console.error("[Claude Code] WebSocket error:", error);
-        };
-    } catch (e) {
-        console.error("[Claude Code] Failed to create WebSocket:", e);
-        terminal.writeln(`\x1b[1;31mFailed to connect: ${e.message}\x1b[0m\n`);
+function sendTerminalSize(state) {
+    const dims = state.fitAddon?.proposeDimensions();
+    if (!dims || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
+        return;
     }
+    state.websocket.send(JSON.stringify({ type: "resize", rows: dims.rows, cols: dims.cols }));
+}
+
+function connectWebSocket(state) {
+    if (state.websocket) {
+        state.websocket.close();
+    }
+
+    state.capabilityError = false;
+    setStateStatus(state, "connecting", "Connecting...");
+    const wsUrl = buildWebSocketUrl(state.adapter.id);
+    const websocket = new WebSocket(wsUrl);
+    state.websocket = websocket;
+
+    websocket.onopen = () => {
+        state.capabilityError = false;
+        setStateStatus(state, "connected", "Connected");
+        state.terminal.clear();
+        fitTerminalState(state);
+        sendTerminalSize(state);
+        setTimeout(() => sendTerminalSize(state), 300);
+        setTimeout(() => sendTerminalSize(state), 800);
+        setTimeout(() => sendTerminalSize(state), 1500);
+        if (workspace.activeAdapterId === state.adapter.id) {
+            state.terminal.focus();
+        }
+    };
+
+    websocket.onmessage = (event) => {
+        const data = event.data;
+        if (data[0] === "o") {
+            const filteredData = data.slice(1).replace(/\x1b\[\[?[IO]/g, "");
+            if (filteredData) {
+                state.terminal.write(filteredData);
+            }
+            return;
+        }
+
+        try {
+            const message = JSON.parse(data);
+            if (message.type === "output" && message.data) {
+                const filteredData = message.data.replace(/\x1b\[\[?[IO]/g, "");
+                if (filteredData) {
+                    state.terminal.write(filteredData);
+                }
+            } else if (message.type === "error" && message.message) {
+                state.capabilityError = true;
+                setStateStatus(state, "unavailable", message.message);
+                state.terminal.writeln(`\x1b[1;31m${message.message}\x1b[0m`);
+            }
+        } catch (error) {
+            console.debug("Ignoring non-JSON websocket message", error);
+        }
+    };
+
+    websocket.onclose = () => {
+        state.websocket = null;
+        if (state.capabilityError) {
+            return;
+        }
+        setStateStatus(state, "disconnected", "Disconnected");
+        state.terminal.writeln("\n\x1b[1;31mTerminal disconnected.\x1b[0m");
+        state.terminal.writeln("Click ↻ to reconnect.\n");
+    };
+
+    websocket.onerror = () => {
+        setStateStatus(state, "disconnected", "Connection error");
+    };
+}
+
+function reloadActiveTerminal() {
+    const state = workspace.terminalStates.get(workspace.activeAdapterId);
+    if (!state) {
+        return;
+    }
+    if (!isTerminalUsable(state.adapter)) {
+        setStateStatus(state, "unavailable", getAdapterUnavailableReason(state.adapter));
+        return;
+    }
+    if (!state.terminal) {
+        return;
+    }
+    state.terminal.clear();
+    state.terminal.writeln("\x1b[1;34mReloading terminal...\x1b[0m\n");
+    connectWebSocket(state);
 }
 
 function makeDraggable(element, handle) {
-    let pos1 = 0,
-        pos2 = 0,
-        pos3 = 0,
-        pos4 = 0;
+    let pos1 = 0;
+    let pos2 = 0;
+    let pos3 = 0;
+    let pos4 = 0;
 
     handle.onmousedown = dragMouseDown;
 
-    function dragMouseDown(e) {
-        // Don't drag if clicking on buttons
-        if (e.target.closest(".claude-btn")) return;
+    function dragMouseDown(event) {
+        if (event.target.closest(".pilot-btn") || event.target.closest(".pilot-tab")) return;
 
-        e.preventDefault();
-        pos3 = e.clientX;
-        pos4 = e.clientY;
+        event.preventDefault();
+        pos3 = event.clientX;
+        pos4 = event.clientY;
         document.onmouseup = closeDragElement;
         document.onmousemove = elementDrag;
     }
 
-    function elementDrag(e) {
-        e.preventDefault();
-        pos1 = pos3 - e.clientX;
-        pos2 = pos4 - e.clientY;
-        pos3 = e.clientX;
-        pos4 = e.clientY;
+    function elementDrag(event) {
+        event.preventDefault();
+        pos1 = pos3 - event.clientX;
+        pos2 = pos4 - event.clientY;
+        pos3 = event.clientX;
+        pos4 = event.clientY;
 
         const newTop = element.offsetTop - pos2;
         const newLeft = element.offsetLeft - pos1;
-
-        // Keep within viewport bounds
         const maxTop = window.innerHeight - element.offsetHeight;
         const maxLeft = window.innerWidth - element.offsetWidth;
 
-        element.style.top = Math.max(0, Math.min(newTop, maxTop)) + "px";
-        element.style.left = Math.max(0, Math.min(newLeft, maxLeft)) + "px";
+        element.style.top = `${Math.max(0, Math.min(newTop, maxTop))}px`;
+        element.style.left = `${Math.max(0, Math.min(newLeft, maxLeft))}px`;
         element.style.right = "auto";
     }
 
@@ -790,90 +1331,79 @@ function makeDraggable(element, handle) {
 }
 
 function makeResizable(element) {
-    const minWidth = 400;
-    const minHeight = 300;
+    const minWidth = 520;
+    const minHeight = 320;
     let resizeTimeout = null;
-
-    // Handle all resize elements
-    const resizeElements = element.querySelectorAll(".claude-resize-edge, .claude-resize-corner");
+    const resizeElements = element.querySelectorAll(".pilot-resize-edge, .pilot-resize-corner");
 
     resizeElements.forEach((resizer) => {
-        resizer.addEventListener("mousedown", (e) => {
-            e.preventDefault();
-            e.stopPropagation();
+        resizer.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
 
-            const startX = e.clientX;
-            const startY = e.clientY;
+            const startX = event.clientX;
+            const startY = event.clientY;
             const startWidth = element.offsetWidth;
             const startHeight = element.offsetHeight;
             const startLeft = element.offsetLeft;
             const startTop = element.offsetTop;
 
-            const isLeft = resizer.classList.contains("claude-resize-w") ||
-                           resizer.classList.contains("claude-resize-nw") ||
-                           resizer.classList.contains("claude-resize-sw");
-            const isTop = resizer.classList.contains("claude-resize-n") ||
-                          resizer.classList.contains("claude-resize-nw") ||
-                          resizer.classList.contains("claude-resize-ne");
-            const isRight = resizer.classList.contains("claude-resize-e") ||
-                            resizer.classList.contains("claude-resize-ne") ||
-                            resizer.classList.contains("claude-resize-se");
-            const isBottom = resizer.classList.contains("claude-resize-s") ||
-                             resizer.classList.contains("claude-resize-sw") ||
-                             resizer.classList.contains("claude-resize-se");
+            const isLeft = resizer.classList.contains("pilot-resize-w")
+                || resizer.classList.contains("pilot-resize-nw")
+                || resizer.classList.contains("pilot-resize-sw");
+            const isTop = resizer.classList.contains("pilot-resize-n")
+                || resizer.classList.contains("pilot-resize-nw")
+                || resizer.classList.contains("pilot-resize-ne");
+            const isRight = resizer.classList.contains("pilot-resize-e")
+                || resizer.classList.contains("pilot-resize-ne")
+                || resizer.classList.contains("pilot-resize-se");
+            const isBottom = resizer.classList.contains("pilot-resize-s")
+                || resizer.classList.contains("pilot-resize-sw")
+                || resizer.classList.contains("pilot-resize-se");
 
-            function resize(e) {
-                const dx = e.clientX - startX;
-                const dy = e.clientY - startY;
+            function resize(moveEvent) {
+                const dx = moveEvent.clientX - startX;
+                const dy = moveEvent.clientY - startY;
 
                 if (isRight) {
-                    const newWidth = Math.max(minWidth, startWidth + dx);
-                    element.style.width = newWidth + "px";
+                    element.style.width = `${Math.max(minWidth, startWidth + dx)}px`;
                 }
 
                 if (isBottom) {
-                    const newHeight = Math.max(minHeight, startHeight + dy);
-                    element.style.height = newHeight + "px";
+                    element.style.height = `${Math.max(minHeight, startHeight + dy)}px`;
                 }
 
                 if (isLeft) {
                     const newWidth = Math.max(minWidth, startWidth - dx);
-                    if (newWidth > minWidth) {
-                        element.style.width = newWidth + "px";
-                        element.style.left = (startLeft + dx) + "px";
+                    if (newWidth >= minWidth) {
+                        element.style.width = `${newWidth}px`;
+                        element.style.left = `${startLeft + dx}px`;
                         element.style.right = "auto";
                     }
                 }
 
                 if (isTop) {
                     const newHeight = Math.max(minHeight, startHeight - dy);
-                    if (newHeight > minHeight) {
-                        element.style.height = newHeight + "px";
-                        element.style.top = (startTop + dy) + "px";
+                    if (newHeight >= minHeight) {
+                        element.style.height = `${newHeight}px`;
+                        element.style.top = `${startTop + dy}px`;
                     }
                 }
 
-                // Debounce terminal fit
                 if (resizeTimeout) {
                     clearTimeout(resizeTimeout);
                 }
                 resizeTimeout = setTimeout(() => {
-                    if (fitAddon) {
-                        window.fitTerminalPreserveScroll();
-                    }
+                    fitAllTerminals();
                 }, 16);
             }
 
             function stopResize() {
                 document.removeEventListener("mousemove", resize);
                 document.removeEventListener("mouseup", stopResize);
-
-                // Final fit after resize
-                if (fitAddon) {
-                    setTimeout(() => {
-                        window.fitTerminalPreserveScroll();
-                    }, 50);
-                }
+                setTimeout(() => {
+                    fitAllTerminals();
+                }, 50);
             }
 
             document.addEventListener("mousemove", resize);
@@ -882,194 +1412,151 @@ function makeResizable(element) {
     });
 }
 
-function addMenuButton(floatingWindow) {
-    // Wait for ComfyUI menu to load
+function addMenuButton(windowElement) {
     const checkMenu = setInterval(() => {
         const menu = document.querySelector(".comfy-menu") || document.querySelector(".comfyui-menu");
-        if (menu) {
-            clearInterval(checkMenu);
-
-            const btn = document.createElement("button");
-            btn.id = "claude-menu-btn";
-            btn.textContent = "Claude Code";
-            btn.addEventListener("click", () => {
-                if (floatingWindow.style.display === "none") {
-                    floatingWindow.style.display = "flex";
-                    if (fitAddon) {
-                        setTimeout(() => window.fitTerminalPreserveScroll(), 100);
-                    }
-                } else {
-                    floatingWindow.style.display = "none";
-                }
-            });
-
-            menu.appendChild(btn);
+        if (!menu) {
+            return;
         }
+
+        clearInterval(checkMenu);
+        const button = document.createElement("button");
+        button.id = "comfy-pilot-menu-btn";
+        button.textContent = "Comfy Pilot";
+        button.addEventListener("click", () => {
+            if (windowElement.style.display === "none") {
+                openFloatingWindow();
+                return;
+            }
+            closeFloatingWindow();
+        });
+
+        menu.appendChild(button);
     }, 500);
 
-    // Stop checking after 10 seconds
     setTimeout(() => clearInterval(checkMenu), 10000);
 }
 
 function addContextMenuOption() {
-    // Hook into LiteGraph's context menu
     const originalGetCanvasMenuOptions = LGraphCanvas.prototype.getCanvasMenuOptions;
 
     LGraphCanvas.prototype.getCanvasMenuOptions = function (...args) {
         const options = originalGetCanvasMenuOptions.apply(this, args);
-
-        // Add separator and Claude Code option
-        options.push(null); // separator
+        options.push(null);
         options.push({
-            content: "Open Claude Code",
+            content: "Open Comfy Pilot",
             callback: () => {
-                if (floatingWindow) {
-                    floatingWindow.style.display = "flex";
-
-                    // Fit terminal and focus
-                    if (fitAddon) {
-                        setTimeout(() => {
-                            window.fitTerminalPreserveScroll();
-                            if (terminal) terminal.focus();
-                        }, 100);
-                    }
+                if (!floatingWindow) {
+                    return;
                 }
+                openFloatingWindow();
             },
         });
-
         return options;
     };
 }
 
-// Handle window resize - debounced and only if size actually changed
-let lastTerminalSize = { cols: 0, rows: 0 };
-let windowResizeTimeout = null;
-
 window.addEventListener("resize", () => {
-    if (fitAddon && floatingWindow && floatingWindow.style.display !== "none") {
-        // Debounce resize events
-        if (windowResizeTimeout) {
-            clearTimeout(windowResizeTimeout);
-        }
-        windowResizeTimeout = setTimeout(() => {
-            const dims = fitAddon.proposeDimensions();
-            if (dims && (dims.cols !== lastTerminalSize.cols || dims.rows !== lastTerminalSize.rows)) {
-                lastTerminalSize = { cols: dims.cols, rows: dims.rows };
-                window.fitTerminalPreserveScroll();
-            }
-        }, 100);
+    if (floatingWindow && floatingWindow.style.display !== "none") {
+        fitAllTerminals();
     }
 });
 
-
-// MCP status checking
 async function checkMcpStatus() {
-    const indicator = document.querySelector(".mcp-indicator");
-    const label = document.querySelector(".mcp-label");
-    if (!indicator) return;
+    if (!floatingWindow || !workspace.activeAdapterId) {
+        return;
+    }
 
-    // Set to checking state
+    const indicator = floatingWindow.querySelector(".mcp-indicator");
+    const label = floatingWindow.querySelector(".mcp-label");
+    if (!indicator || !label) {
+        return;
+    }
+
     indicator.className = "mcp-indicator checking";
     label.textContent = "MCP...";
 
     try {
-        // Try to reach the MCP server via our backend endpoint
-        const response = await fetch("/claude-code/mcp-status", {
-            method: "GET",
-            signal: AbortSignal.timeout(3000)
-        });
-        const data = await response.json();
-
-        if (data.connected) {
+        const response = await fetchJson(`${API_BASE}/mcp-status?adapter=${encodeURIComponent(workspace.activeAdapterId)}`);
+        if (response.ready) {
             indicator.className = "mcp-indicator connected";
             label.textContent = "MCP";
-            indicator.parentElement.title = `MCP Connected - ${data.tools || 0} tools available`;
+            indicator.parentElement.title = `${response.label} MCP ready`;
         } else {
             indicator.className = "mcp-indicator disconnected";
             label.textContent = "MCP";
-            indicator.parentElement.title = `MCP Disconnected - ${data.error || "Not running"}`;
+            indicator.parentElement.title = `${response.label}: ${response.error || "MCP not ready"}`;
         }
-    } catch (e) {
+    } catch (error) {
         indicator.className = "mcp-indicator disconnected";
         label.textContent = "MCP";
-        indicator.parentElement.title = "MCP Status Unknown - Could not check";
+        indicator.parentElement.title = "MCP status unknown";
     }
 }
 
-// Workflow sync - send current workflow to backend periodically
 function startWorkflowSync() {
-    // Sync immediately and then every 2 seconds
     syncWorkflow();
     setInterval(syncWorkflow, 2000);
 
-    // Also poll for graph commands
     pollGraphCommands();
     setInterval(pollGraphCommands, 200);
 }
 
-// Track if workflow has changed to avoid unnecessary syncs
 let lastWorkflowHash = null;
 
 async function syncWorkflow() {
     try {
         if (!app.graph) return;
 
-        // Get the workflow in ComfyUI's format
         const workflow = app.graph.serialize();
-
-        // Simple hash to detect changes - avoid syncing if nothing changed
         const workflowStr = JSON.stringify(workflow);
-        const hash = workflowStr.length + "_" + (workflowStr.charCodeAt(100) || 0);
+        const hash = `${workflowStr.length}_${workflowStr.charCodeAt(100) || 0}`;
         if (hash === lastWorkflowHash) return;
         lastWorkflowHash = hash;
 
-        // Send to backend (without graphToPrompt which can cause UI flicker)
-        await fetch("/claude-code/workflow", {
+        await fetch(`${API_BASE}/workflow`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
-                workflow: workflow,
-                workflow_api: null,  // Only fetch on demand to avoid flicker
+                workflow,
+                workflow_api: null,
                 timestamp: Date.now(),
             }),
         });
-    } catch (e) {
-        // Silently fail - don't spam console
+    } catch (error) {
+        // Ignore sync errors to avoid console spam.
     }
 }
 
-// Get workflow API format on demand (called before running nodes)
 async function getWorkflowApi() {
     try {
         if (!app.graph) return null;
         return await app.graphToPrompt();
-    } catch (e) {
+    } catch (error) {
         return null;
     }
 }
 
 async function pollGraphCommands() {
     try {
-        const response = await fetch("/claude-code/graph-command");
+        const response = await fetch(`${API_BASE}/graph-command`);
         const data = await response.json();
 
         if (data.command) {
             const result = await executeGraphCommand(data.command);
-
-            // Send result back
-            await fetch("/claude-code/graph-command", {
+            await fetch(`${API_BASE}/graph-command`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     command_id: data.command.id,
-                    result: result
-                })
+                    result,
+                }),
             });
         }
-    } catch (e) {
-        // Silently fail
+    } catch (error) {
+        // Ignore polling errors.
     }
 }
 
@@ -1083,23 +1570,20 @@ async function executeGraphCommand(command) {
 
         switch (action) {
             case "get_workflow_api": {
-                // Fetch workflow API format on demand (for run_node)
                 try {
                     const workflowApi = await app.graphToPrompt();
                     return { workflow_api: workflowApi };
-                } catch (e) {
-                    return { error: `Failed to get workflow API: ${e.message}` };
+                } catch (error) {
+                    return { error: `Failed to get workflow API: ${error.message}` };
                 }
             }
 
             case "queue_prompt": {
-                // Queue prompt from frontend so it uses the browser's client_id
-                // This ensures preview images show up in the UI
                 try {
-                    await app.queuePrompt(0, 1);  // queue at front, 1 batch
+                    await app.queuePrompt(0, 1);
                     return { status: "queued" };
-                } catch (e) {
-                    return { error: `Failed to queue prompt: ${e.message}` };
+                } catch (error) {
+                    return { error: `Failed to queue prompt: ${error.message}` };
                 }
             }
 
@@ -1112,9 +1596,8 @@ async function executeGraphCommand(command) {
                 if (app.canvas && app.canvas.centerOnNode) {
                     app.canvas.centerOnNode(node);
                     return { status: "centered", node_id: params.node_id };
-                } else {
-                    return { error: "Canvas centerOnNode not available" };
                 }
+                return { error: "Canvas centerOnNode not available" };
             }
 
             case "create_node": {
@@ -1127,33 +1610,29 @@ async function executeGraphCommand(command) {
                 const nodeHeight = node.size ? node.size[1] : 100;
                 const gap = 30;
 
-                // Helper to check if position collides with any existing node
                 const checkCollision = (x, y, w, h) => {
                     for (const other of app.graph._nodes) {
                         if (other === node) continue;
-                        const ox = other.pos[0], oy = other.pos[1];
+                        const ox = other.pos[0];
+                        const oy = other.pos[1];
                         const ow = other.size ? other.size[0] : 200;
                         const oh = other.size ? other.size[1] : 100;
-                        // Check rectangle overlap
                         if (x < ox + ow && x + w > ox && y < oy + oh && y + h > oy) {
-                            return other; // Return colliding node
+                            return other;
                         }
                     }
                     return null;
                 };
 
-                // Helper to find free position near target
                 const findFreePosition = (startX, startY) => {
-                    let x = startX, y = startY;
-                    const collider = checkCollision(x, y, nodeWidth, nodeHeight);
-                    if (!collider) return [x, y];
+                    const collider = checkCollision(startX, startY, nodeWidth, nodeHeight);
+                    if (!collider) return [startX, startY];
 
-                    // Try directions: right, below, left, above (expanding outward)
                     const directions = [
-                        [1, 0],  // right
-                        [0, 1],  // below
-                        [-1, 0], // left
-                        [0, -1]  // above
+                        [1, 0],
+                        [0, 1],
+                        [-1, 0],
+                        [0, -1],
                     ];
 
                     for (let distance = 1; distance <= 10; distance++) {
@@ -1165,40 +1644,23 @@ async function executeGraphCommand(command) {
                             }
                         }
                     }
-                    // Fallback: just offset right
+
                     return [startX + nodeWidth + gap, startY];
                 };
 
-                // Handle place_in_view - position at viewport center
                 if (params.place_in_view && app.canvas) {
                     const canvas = app.canvas;
                     const offset = canvas.ds.offset;
                     const scale = canvas.ds.scale;
-
-                    // Account for sidebars/UI - the actual graph area is smaller than canvas
-                    // Left sidebar is roughly 130px, we'll shift the center left
                     const sidebarOffset = 130;
                     const screenCenterX = (canvas.canvas.width - sidebarOffset) / 2;
                     const screenCenterY = canvas.canvas.height / 2;
-
-                    // Calculate visible area in graph coordinates
-                    // Formula: graphPos = (screenPos - offset) / scale
                     const centerX = (screenCenterX - offset[0]) / scale;
                     const centerY = (screenCenterY - offset[1]) / scale;
-
-                    console.log("[place_in_view] offset:", offset, "scale:", scale);
-                    console.log("[place_in_view] adjusted screen center:", screenCenterX, screenCenterY);
-                    console.log("[place_in_view] graph center:", centerX, centerY);
-
-                    // Center the node (not top-left corner)
-                    const targetX = centerX - nodeWidth / 2;
+                    const targetX = centerX - nodeWidth / 2 + (params.viewport_offset || 0);
                     const targetY = centerY - nodeHeight / 2;
-
-                    // Find free position (auto-avoid collisions)
                     node.pos = findFreePosition(targetX, targetY);
-                    console.log("[place_in_view] final node pos:", node.pos);
                 } else {
-                    // Explicit position - also check for collisions
                     const targetX = params.pos_x || 100;
                     const targetY = params.pos_y || 100;
                     node.pos = findFreePosition(targetX, targetY);
@@ -1215,7 +1677,7 @@ async function executeGraphCommand(command) {
                     type: params.type,
                     title: node.title,
                     pos: node.pos,
-                    size: node.size
+                    size: node.size,
                 };
             }
 
@@ -1229,7 +1691,7 @@ async function executeGraphCommand(command) {
                 app.graph.setDirtyCanvas(true, true);
                 return {
                     status: "deleted",
-                    node_id: params.node_id
+                    node_id: params.node_id,
                 };
             }
 
@@ -1240,7 +1702,6 @@ async function executeGraphCommand(command) {
                     return { error: `Node ${params.node_id} not found` };
                 }
 
-                // Try to find the widget by name
                 let found = false;
                 if (node.widgets) {
                     for (const widget of node.widgets) {
@@ -1256,7 +1717,6 @@ async function executeGraphCommand(command) {
                 }
 
                 if (!found) {
-                    // Try setting as a direct property
                     if (params.property_name in node) {
                         node[params.property_name] = params.value;
                         found = true;
@@ -1275,7 +1735,7 @@ async function executeGraphCommand(command) {
                     status: "updated",
                     node_id: params.node_id,
                     property: params.property_name,
-                    value: params.value
+                    value: params.value,
                 };
             }
 
@@ -1301,7 +1761,7 @@ async function executeGraphCommand(command) {
                     from_slot: params.from_slot,
                     to_node: params.to_node_id,
                     to_slot: params.to_slot,
-                    link_id: link ? link.id : null
+                    link_id: link ? link.id : null,
                 };
             }
 
@@ -1318,7 +1778,6 @@ async function executeGraphCommand(command) {
                     return { error: `Target node ${params.to_node_id} not found` };
                 }
 
-                // Find and remove the link
                 if (toNode.inputs && toNode.inputs[params.to_slot]) {
                     const linkId = toNode.inputs[params.to_slot].link;
                     if (linkId !== null) {
@@ -1332,7 +1791,7 @@ async function executeGraphCommand(command) {
                     from_node: params.from_node_id,
                     from_slot: params.from_slot,
                     to_node: params.to_node_id,
-                    to_slot: params.to_slot
+                    to_slot: params.to_slot,
                 };
             }
 
@@ -1344,10 +1803,10 @@ async function executeGraphCommand(command) {
                     return { error: `Node ${params.node_id} not found` };
                 }
 
-                let newX, newY;
+                let newX;
+                let newY;
 
                 if (params.relative_to && params.direction) {
-                    // Relative positioning
                     const refNodeId = parseInt(params.relative_to);
                     const refNode = app.graph.getNodeById(refNodeId);
 
@@ -1380,13 +1839,11 @@ async function executeGraphCommand(command) {
                         default:
                             return { error: `Unknown direction: ${params.direction}` };
                     }
-                } else if (params.x !== null && params.x !== undefined &&
-                           params.y !== null && params.y !== undefined) {
-                    // Absolute positioning
+                } else if (params.x !== null && params.x !== undefined
+                        && params.y !== null && params.y !== undefined) {
                     newX = params.x;
                     newY = params.y;
                 } else if (params.width || params.height) {
-                    // Resize only, no move - keep current position
                     newX = node.pos[0];
                     newY = node.pos[1];
                 } else {
@@ -1395,12 +1852,11 @@ async function executeGraphCommand(command) {
 
                 node.pos = [newX, newY];
 
-                // Apply resize if specified
                 if (params.width || params.height) {
                     const currentSize = node.size || [200, 100];
                     node.size = [
                         params.width || currentSize[0],
-                        params.height || currentSize[1]
+                        params.height || currentSize[1],
                     ];
                 }
 
@@ -1410,14 +1866,14 @@ async function executeGraphCommand(command) {
                     status: "moved",
                     node_id: params.node_id,
                     pos: node.pos,
-                    size: node.size
+                    size: node.size,
                 };
             }
 
             default:
                 return { error: `Unknown action: ${action}` };
         }
-    } catch (e) {
-        return { error: e.message || String(e) };
+    } catch (error) {
+        return { error: error.message || String(error) };
     }
 }

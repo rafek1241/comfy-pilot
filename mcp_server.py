@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MCP Server for ComfyUI - Exposes workflow tools to Claude Code.
+MCP Server for ComfyUI - Exposes workflow tools to supported CLI agents.
 
 This server connects to ComfyUI's API and provides tools to:
 - View the current workflow
@@ -12,7 +12,7 @@ This server connects to ComfyUI's API and provides tools to:
 Usage:
     python mcp_server.py
 
-Configure in Claude Code's settings (~/.claude/settings.json):
+Configure in your CLI agent's MCP/tool settings:
 {
     "mcpServers": {
         "comfyui": {
@@ -69,6 +69,10 @@ def get_comfyui_url() -> str:
     return "http://127.0.0.1:8000"  # Default for desktop version
 
 COMFYUI_URL = None  # Will be set on first request
+PLUGIN_ENDPOINTS = {
+    "workflow": ["/comfy-pilot/workflow", "/claude-code/workflow"],
+    "graph_command": ["/comfy-pilot/graph-command", "/claude-code/graph-command"],
+}
 
 # Cache for object_info (node types) - this rarely changes
 _object_info_cache = None
@@ -134,10 +138,25 @@ def make_request(endpoint: str, method: str = "GET", data: dict = None, timeout:
         return {"error": f"Unexpected error: {type(e).__name__}: {e}"}
 
 
+def make_plugin_request(endpoint_name: str, method: str = "GET", data: dict = None, timeout: int = None) -> dict:
+    """Try provider-neutral plugin endpoints first, then legacy compatibility routes."""
+    last_result = {"error": f"Unknown plugin endpoint: {endpoint_name}"}
+
+    for endpoint in PLUGIN_ENDPOINTS.get(endpoint_name, []):
+        result = make_request(endpoint, method=method, data=data, timeout=timeout)
+        if "error" not in result:
+            return result
+        last_result = result
+        if "404" not in result.get("error", ""):
+            return result
+
+    return last_result
+
+
 def get_workflow() -> dict:
     """Get the current workflow from ComfyUI."""
     # First try to get the live workflow from our plugin endpoint
-    live_workflow = make_request("/claude-code/workflow")
+    live_workflow = make_plugin_request("workflow")
 
     if live_workflow and live_workflow.get("workflow"):
         return {
@@ -154,7 +173,7 @@ def get_workflow() -> dict:
         return history
 
     if not history:
-        return {"message": "No workflow found. Make sure ComfyUI is open in a browser with the Claude Code plugin loaded."}
+        return {"message": "No workflow found. Make sure ComfyUI is open in a browser with the Comfy Pilot plugin loaded."}
 
     # Get the most recent prompt
     latest_id = list(history.keys())[-1] if history else None
@@ -883,7 +902,7 @@ def run_node(node_ids) -> dict:
 
 def send_graph_command(action: str, params: dict) -> dict:
     """Send a graph manipulation command to the frontend."""
-    result = make_request("/claude-code/graph-command", method="POST", data={
+    result = make_plugin_request("graph_command", method="POST", data={
         "action": action,
         "params": params
     })
