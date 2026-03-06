@@ -26,3 +26,7 @@ Thumbs.db
 # Logs
 *.log
 node.zip
+
+# Custom
+.comfy_pilot_settings.json
+uv.lock
