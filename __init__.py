@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import struct
+import subprocess
 import sys
 
 from aiohttp import web
@@ -15,6 +16,7 @@ try:
         ensure_adapter_mcp_config,
         get_adapter,
         get_adapter_mcp_status,
+        get_terminal_backend_status,
         install_claude_code,
         list_adapters,
         pick_active_adapter_id,
@@ -26,6 +28,7 @@ except ImportError:  # pragma: no cover - fallback for direct execution
         ensure_adapter_mcp_config,
         get_adapter,
         get_adapter_mcp_status,
+        get_terminal_backend_status,
         install_claude_code,
         list_adapters,
         pick_active_adapter_id,
@@ -48,6 +51,10 @@ else:
     resource = None
     signal = None
     termios = None
+    try:
+        from winpty import PTY
+    except ImportError:
+        PTY = None
 
 WEB_DIRECTORY = "./js"
 
@@ -76,14 +83,42 @@ class WebSocketTerminal:
     def __init__(self):
         self.fd = None
         self.pid = None
+        self.process = None
         self.running = False
+        self.last_error = ""
         self._decoder = None
 
-    def spawn(self, command=None):
+    def spawn(self, command=None, rows=24, cols=80):
         """Spawn a new PTY with an optional command."""
         if IS_WINDOWS:
-            print(f"{PLUGIN_LOG_PREFIX} Terminal not supported on Windows")
-            return False
+            if PTY is None:
+                self.last_error = get_terminal_backend_status().get("reason") or (
+                    "Windows terminal backend unavailable"
+                )
+                print(f"{PLUGIN_LOG_PREFIX} {self.last_error}")
+                return False
+
+            spawn_target = command or [os.environ.get("COMSPEC", "cmd.exe")]
+            if isinstance(spawn_target, str):
+                appname = os.environ.get("COMSPEC", "cmd.exe")
+                cmdline = f'/d /s /c "{spawn_target}"'
+            else:
+                appname = spawn_target[0]
+                cmdline = subprocess.list2cmdline(spawn_target[1:]) if len(spawn_target) > 1 else None
+
+            try:
+                self.process = PTY(cols, rows)
+                self.process.spawn(appname, cmdline=cmdline, cwd=os.getcwd())
+                self.pid = self.process.pid
+            except Exception as exc:
+                self.process = None
+                self.pid = None
+                self.last_error = f"Failed to start Windows terminal: {exc}"
+                print(f"{PLUGIN_LOG_PREFIX} {self.last_error}")
+                return False
+
+            self.running = True
+            return True
 
         shell = os.environ.get("SHELL", "/bin/bash")
         self.pid, self.fd = pty.fork()
@@ -106,7 +141,16 @@ class WebSocketTerminal:
 
     def resize(self, rows, cols):
         """Resize the PTY and notify the child process."""
-        if IS_WINDOWS or not self.fd:
+        if IS_WINDOWS:
+            if not self.process:
+                return
+            try:
+                self.process.set_size(cols, rows)
+            except Exception:
+                self.running = False
+            return
+
+        if not self.fd:
             return
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
@@ -118,13 +162,36 @@ class WebSocketTerminal:
 
     def write(self, data):
         """Write data to the PTY."""
-        if IS_WINDOWS or not self.fd:
+        if IS_WINDOWS:
+            if not self.process:
+                return
+            try:
+                self.process.write(data)
+            except Exception:
+                self.running = False
+            return
+
+        if not self.fd:
             return
         os.write(self.fd, data.encode("utf-8"))
 
     def read_nonblock(self):
         """Non-blocking read from PTY."""
-        if IS_WINDOWS or not self.fd:
+        if IS_WINDOWS:
+            if not self.process:
+                return None
+            try:
+                data = self.process.read(blocking=False)
+                if data:
+                    return data
+                if not self.process.isalive() or self.process.iseof():
+                    self.running = False
+            except Exception:
+                if not self.process.isalive() or self.process.iseof():
+                    self.running = False
+            return None
+
+        if not self.fd:
             return None
         try:
             data = os.read(self.fd, 4096)
@@ -144,6 +211,19 @@ class WebSocketTerminal:
         """Close the PTY."""
         self.running = False
         if IS_WINDOWS:
+            if self.process:
+                try:
+                    self.process.cancel_io()
+                except Exception:
+                    pass
+                try:
+                    if self.process.isalive():
+                        os.kill(self.process.pid, 9)
+                except Exception:
+                    pass
+                del self.process
+                self.process = None
+            self.pid = None
             return
         if self.fd:
             try:
@@ -166,11 +246,12 @@ class TerminalSessionManager:
     def __init__(self):
         self._sessions = {}
 
-    def add(self, session_id, adapter_id, terminal, window_session_id=None):
+    def add(self, session_id, adapter_id, terminal, websocket=None, window_session_id=None):
         self._sessions[session_id] = {
             "adapter_id": adapter_id,
             "window_session_id": window_session_id,
             "terminal": terminal,
+            "websocket": websocket,
         }
 
     def remove(self, session_id):
@@ -178,6 +259,32 @@ class TerminalSessionManager:
 
     def count(self):
         return len(self._sessions)
+
+    async def close_window_session(self, window_session_id):
+        if not window_session_id:
+            return
+
+        matching_session_ids = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.get("window_session_id") == window_session_id
+        ]
+
+        for session_id in matching_session_ids:
+            session = self._sessions.get(session_id)
+            if not session:
+                continue
+            terminal = session.get("terminal")
+            websocket = session.get("websocket")
+            if terminal:
+                terminal.running = False
+                terminal.close()
+            if websocket and not websocket.closed:
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+            self.remove(session_id)
 
 
 terminal_session_manager = TerminalSessionManager()
@@ -434,11 +541,13 @@ async def mcp_status_handler(request):
 
 async def platform_info_handler(request):
     """Return platform information."""
+    terminal_backend = get_terminal_backend_status()
     return web.json_response(
         {
             "platform": sys.platform,
             "is_windows": IS_WINDOWS,
-            "terminal_supported": not IS_WINDOWS,
+            "terminal_supported": terminal_backend["supported"],
+            "terminal_backend": terminal_backend.get("backend"),
             "python_version": sys.version,
             "comfyui_url": get_comfyui_url_cached(),
             "default_cli": load_settings().get("default_cli", DEFAULT_ADAPTER_ID),
@@ -454,26 +563,30 @@ async def websocket_handler(request):
     adapter = get_requested_adapter(request)
     window_session_id = request.query.get("session")
 
-    if IS_WINDOWS:
-        adapter_status = adapter.to_public_dict()
+    terminal_backend = get_terminal_backend_status()
+    if not terminal_backend["supported"]:
         await ws.send_str(
             json.dumps(
                 {
                     "type": "error",
-                    "message": adapter_status.get("unavailable_reason")
-                    or (
-                        f"Embedded terminals are not supported on Windows for {adapter.label}. "
-                        "Use the CLI directly and keep Comfy Pilot's REST/MCP integration."
-                    ),
+                    "message": terminal_backend["reason"],
                 }
             )
         )
         await ws.close()
         return ws
 
+    await terminal_session_manager.close_window_session(window_session_id)
+
     session_id = id(ws)
     terminal = WebSocketTerminal()
-    terminal_session_manager.add(session_id, adapter.id, terminal, window_session_id=window_session_id)
+    terminal_session_manager.add(
+        session_id,
+        adapter.id,
+        terminal,
+        websocket=ws,
+        window_session_id=window_session_id,
+    )
     terminal_started = False
 
     print(f"{PLUGIN_LOG_PREFIX} WebSocket connected: session={session_id} adapter={adapter.id}")
@@ -482,13 +595,18 @@ async def websocket_handler(request):
     settings = load_settings()
     command_override = settings.get("command_overrides", {}).get(adapter.id)
     explicit_command = request.query.get("cmd")
-    command = explicit_command or adapter.build_command(os.getcwd(), command_override=command_override)
+    if explicit_command and IS_WINDOWS:
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", explicit_command]
+    else:
+        command = explicit_command or adapter.build_spawn_command(
+            os.getcwd(), command_override=command_override
+        )
 
     if not explicit_command and adapter.id == "claude" and not adapter.is_available():
         print(f"{PLUGIN_LOG_PREFIX} Claude CLI not found, attempting auto-install...")
         success, message = install_claude_code()
         if success:
-            command = adapter.build_command(os.getcwd(), command_override=command_override)
+            command = adapter.build_spawn_command(os.getcwd(), command_override=command_override)
             print(f"{PLUGIN_LOG_PREFIX} Claude CLI installed, using command: {command}")
         else:
             print(f"{PLUGIN_LOG_PREFIX} Claude auto-install failed: {message}")
@@ -502,6 +620,18 @@ async def websocket_handler(request):
 
     async def read_pty():
         """Read from PTY and send to WebSocket."""
+        if IS_WINDOWS:
+            try:
+                while terminal.running and not ws.closed:
+                    data = terminal.read_nonblock()
+                    if data:
+                        await ws.send_str("o" + data)
+                        continue
+                    await asyncio.sleep(0.02)
+            except Exception as exc:
+                print(f"{PLUGIN_LOG_PREFIX} Read error ({adapter.id}): {exc}")
+            return
+
         loop = asyncio.get_event_loop()
         fd = terminal.fd
         read_event = asyncio.Event()
@@ -550,9 +680,20 @@ async def websocket_handler(request):
                         cols = data.get("cols", 80)
 
                         if not terminal_started:
-                            terminal.spawn(command)
+                            terminal_started = terminal.spawn(command, rows=rows, cols=cols)
+                            if not terminal_started:
+                                await ws.send_str(
+                                    json.dumps(
+                                        {
+                                            "type": "error",
+                                            "message": terminal.last_error
+                                            or f"Failed to start {adapter.label} terminal.",
+                                        }
+                                    )
+                                )
+                                await ws.close()
+                                break
                             terminal.resize(rows, cols)
-                            terminal_started = True
                             read_task = asyncio.create_task(read_pty())
                             print(
                                 f"{PLUGIN_LOG_PREFIX} Terminal started: "
@@ -682,8 +823,9 @@ def setup_routes(app):
     print(f"{PLUGIN_LOG_PREFIX} Graph command endpoint registered at {ROUTE_BASE}/graph-command")
     print(f"{PLUGIN_LOG_PREFIX} CLI inventory endpoint registered at {ROUTE_BASE}/clis")
     print(f"{PLUGIN_LOG_PREFIX} Settings endpoint registered at {ROUTE_BASE}/settings")
-    if IS_WINDOWS:
-        print(f"{PLUGIN_LOG_PREFIX} Note: Terminal functionality disabled on Windows")
+    terminal_backend = get_terminal_backend_status()
+    if IS_WINDOWS and not terminal_backend["supported"]:
+        print(f"{PLUGIN_LOG_PREFIX} Note: {terminal_backend['reason']}")
 
 
 # Hook into ComfyUI's server setup
@@ -695,7 +837,13 @@ try:
     maybe_setup_default_adapter_mcp()
 
     mem_mb = get_memory_mb()
-    platform_note = " (Windows - terminal disabled)" if IS_WINDOWS else ""
+    terminal_backend = get_terminal_backend_status()
+    if IS_WINDOWS and not terminal_backend["supported"]:
+        platform_note = " (Windows terminal backend unavailable)"
+    elif IS_WINDOWS:
+        platform_note = " (Windows terminal enabled)"
+    else:
+        platform_note = ""
     print(f"{PLUGIN_LOG_PREFIX} Plugin loaded successfully{platform_note} (Memory: {mem_mb:.1f}MB)")
 except Exception as exc:
     print(f"{PLUGIN_LOG_PREFIX} Failed to register routes: {exc}")

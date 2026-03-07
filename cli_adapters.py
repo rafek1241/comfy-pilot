@@ -13,6 +13,7 @@ import sys
 IS_WINDOWS = sys.platform == "win32"
 MCP_SERVER_NAME = "comfyui"
 WINDOWS_COMMAND_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1")
+WINDOWS_TERMINAL_BACKEND_HINT = "Install pywinpty to enable embedded terminals on Windows."
 WINDOWS_PATH_GUIDANCE = (
     "If it is already installed, add its launch-script directory to PATH for the ComfyUI process "
     "and restart ComfyUI. Common Windows locations include %APPDATA%\\npm, C:\\nvm4w\\nodejs, "
@@ -162,6 +163,48 @@ def _join_command(parts: list[str]) -> str:
     return " ".join(_quote_part(part) for part in parts if part)
 
 
+def _find_cmd_executable() -> str:
+    return os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+
+
+def _find_powershell_executable() -> str:
+    return shutil.which("pwsh.exe") or shutil.which("powershell.exe") or "powershell.exe"
+
+
+def get_terminal_backend_status() -> dict:
+    if not IS_WINDOWS:
+        return {"supported": True, "backend": "pty", "reason": ""}
+
+    try:
+        import winpty  # noqa: F401
+    except ImportError:
+        return {
+            "supported": False,
+            "backend": None,
+            "reason": WINDOWS_TERMINAL_BACKEND_HINT,
+        }
+
+    return {"supported": True, "backend": "pywinpty", "reason": ""}
+
+
+def _build_windows_spawn_command(executable: str, arguments: list[str]) -> list[str]:
+    extension = os.path.splitext(executable)[1].lower()
+    if extension == ".ps1":
+        return [
+            _find_powershell_executable(),
+            "-NoLogo",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            executable,
+            *arguments,
+        ]
+    if extension in (".cmd", ".bat"):
+        command_line = subprocess.list2cmdline([executable, *arguments])
+        return [_find_cmd_executable(), "/d", "/s", "/c", command_line]
+    return [executable, *arguments]
+
+
 @dataclass(frozen=True)
 class CliAdapter:
     id: str
@@ -185,7 +228,7 @@ class CliAdapter:
         return self.find_executable() is not None
 
     def is_terminal_supported(self) -> bool:
-        return not IS_WINDOWS
+        return get_terminal_backend_status()["supported"]
 
     def is_terminal_usable(self) -> bool:
         return self.find_executable() is not None and self.is_terminal_supported()
@@ -198,16 +241,14 @@ class CliAdapter:
     def describe_terminal_availability(self) -> dict:
         executable = self.find_executable()
         available = executable is not None
-        terminal_supported = self.is_terminal_supported()
+        backend_status = get_terminal_backend_status()
+        terminal_supported = backend_status["supported"]
         terminal_usable = available and terminal_supported
 
         if terminal_usable:
             unavailable_reason = ""
         elif available:
-            unavailable_reason = (
-                f"{self.label} was found at '{executable}', but embedded terminals are not supported on "
-                "Windows yet. Use the CLI directly and keep Comfy Pilot's REST/MCP integration."
-            )
+            unavailable_reason = backend_status["reason"]
         else:
             unavailable_reason = self.install_advice()
 
@@ -225,6 +266,25 @@ class CliAdapter:
         if self.resume_argument and has_claude_conversation(working_dir):
             parts.append(self.resume_argument)
         return _join_command(parts)
+
+    def build_spawn_command(
+        self,
+        working_dir: str | None = None,
+        command_override: str | None = None,
+    ) -> str | list[str]:
+        if command_override:
+            if IS_WINDOWS:
+                return [_find_cmd_executable(), "/d", "/s", "/c", command_override]
+            return command_override
+
+        executable = self.find_executable() or self.fallback_command
+        arguments = []
+        if self.resume_argument and has_claude_conversation(working_dir):
+            arguments.append(self.resume_argument)
+
+        if IS_WINDOWS:
+            return _build_windows_spawn_command(executable, arguments)
+        return _join_command([executable, *arguments])
 
     def to_public_dict(self) -> dict:
         public_status = self.describe_terminal_availability()

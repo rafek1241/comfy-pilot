@@ -179,7 +179,9 @@ Only CLIs with a usable embedded terminal are shown as live tabs by default. You
 
 ### Windows
 
-Comfy Pilot's embedded terminals currently rely on Unix PTY support, so native Windows keeps the REST/MCP workflow integration but does not host live terminal tabs yet. If a CLI should be detected but is reported missing, make sure its launch script directory is on PATH for the ComfyUI process, then restart ComfyUI. Common Windows locations include `%APPDATA%\npm`, `C:\nvm4w\nodejs`, and your virtualenv's `Scripts` folder.
+Comfy Pilot now supports embedded terminals on native Windows by using the ConPTY/winpty backend provided by `pywinpty`. The Windows package dependency is declared in this project; if you manage the environment manually and terminals are still unavailable, install `pywinpty` into the same Python environment that runs ComfyUI and restart ComfyUI.
+
+If a CLI should be detected but is reported missing, make sure its launch script directory is on PATH for the ComfyUI process, then restart ComfyUI. Common Windows locations include `%APPDATA%\npm`, `C:\nvm4w\nodejs`, and your virtualenv's `Scripts` folder.
 
 ### "Command 'claude' not found"
 

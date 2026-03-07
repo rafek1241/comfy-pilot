@@ -12,6 +12,10 @@ const CLI_OPTIONS = [
     { value: "kilo", label: "Kilo Code CLI" },
 ];
 
+function createWindowSessionId() {
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 let floatingWindow = null;
 let actionbarReopenButton = null;
 const workspace = {
@@ -24,7 +28,7 @@ const workspace = {
     },
     activeAdapterId: null,
     terminalStates: new Map(),
-    windowSessionId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    windowSessionId: createWindowSessionId(),
 };
 
 app.registerExtension({
@@ -169,10 +173,14 @@ function updateWindowVisibility(visible, { persist = true, focusTerminal = true 
 }
 
 function openFloatingWindow({ persist = true, focusTerminal = true } = {}) {
+    workspace.windowSessionId = createWindowSessionId();
     updateWindowVisibility(true, { persist, focusTerminal });
+    renderWorkspace();
+    ensureActiveTerminalConnection();
 }
 
 function closeFloatingWindow({ persist = true } = {}) {
+    shutdownTerminalWorkspace({ disposeTerminals: true, resetSession: true });
     updateWindowVisibility(false, { persist, focusTerminal: false });
 }
 
@@ -871,6 +879,7 @@ function renderWorkspace() {
     panesContainer.innerHTML = "";
 
     const visibleAdapters = getVisibleAdapters();
+    pruneTerminalStates(visibleAdapters);
     if (!visibleAdapters.length) {
         panesContainer.innerHTML = `
             <div class="pilot-empty-state">
@@ -913,9 +922,7 @@ function renderWorkspace() {
 
         if (terminalUsable) {
             pane.appendChild(state.host);
-            if (!state.initialized) {
-                initTerminalState(state);
-            } else {
+            if (state.initialized) {
                 requestAnimationFrame(() => fitTerminalState(state));
             }
         } else {
@@ -938,6 +945,17 @@ function renderWorkspace() {
     selectAdapterTab(workspace.activeAdapterId);
 }
 
+function pruneTerminalStates(visibleAdapters) {
+    const visibleAdapterIds = new Set(visibleAdapters.map((adapter) => adapter.id));
+    for (const [adapterId, state] of workspace.terminalStates.entries()) {
+        if (visibleAdapterIds.has(adapterId)) {
+            continue;
+        }
+        destroyTerminalState(state);
+        workspace.terminalStates.delete(adapterId);
+    }
+}
+
 function ensureTerminalState(adapter) {
     let state = workspace.terminalStates.get(adapter.id);
     if (!state) {
@@ -955,10 +973,65 @@ function ensureTerminalState(adapter) {
             status: isTerminalUsable(adapter) ? "connecting" : "unavailable",
             statusMessage: "",
             capabilityError: false,
+            connectionNonce: 0,
+            pendingTimers: [],
         };
         workspace.terminalStates.set(adapter.id, state);
     }
     return state;
+}
+
+function clearPendingTimers(state) {
+    for (const timerId of state.pendingTimers || []) {
+        clearTimeout(timerId);
+    }
+    state.pendingTimers = [];
+}
+
+function closeStateWebSocket(state) {
+    clearPendingTimers(state);
+    state.connectionNonce += 1;
+    const websocket = state.websocket;
+    state.websocket = null;
+    if (websocket && websocket.readyState < WebSocket.CLOSING) {
+        websocket.close();
+    }
+}
+
+function disconnectTerminalState(state) {
+    closeStateWebSocket(state);
+    if (isTerminalUsable(state.adapter)) {
+        setStateStatus(state, "disconnected", "Disconnected");
+    }
+}
+
+function destroyTerminalState(state) {
+    disconnectTerminalState(state);
+    state.capabilityError = false;
+    if (state.terminal) {
+        try {
+            state.terminal.dispose();
+        } catch (error) {
+            console.debug("Failed to dispose terminal", error);
+        }
+    }
+    state.host.textContent = "";
+    state.terminal = null;
+    state.fitAddon = null;
+    state.initialized = false;
+}
+
+function shutdownTerminalWorkspace({ disposeTerminals = false, resetSession = false } = {}) {
+    for (const state of workspace.terminalStates.values()) {
+        if (disposeTerminals) {
+            destroyTerminalState(state);
+        } else {
+            disconnectTerminalState(state);
+        }
+    }
+    if (resetSession) {
+        workspace.windowSessionId = createWindowSessionId();
+    }
 }
 
 function updateActiveCliLabel() {
@@ -1006,6 +1079,7 @@ function selectAdapterTab(adapterId) {
     }
 
     const activeState = workspace.terminalStates.get(adapterId);
+    ensureActiveTerminalConnection();
     if (activeState?.terminal) {
         setTimeout(() => {
             fitTerminalState(activeState);
@@ -1160,7 +1234,38 @@ function initTerminalState(state) {
     }, 200);
 
     setTimeout(() => fitTerminalState(state), 100);
-    connectWebSocket(state);
+}
+
+function ensureActiveTerminalConnection() {
+    if (!shouldShowFloatingWindow()) {
+        return;
+    }
+
+    for (const state of workspace.terminalStates.values()) {
+        if (state.adapter.id !== workspace.activeAdapterId) {
+            disconnectTerminalState(state);
+        }
+    }
+
+    const activeState = workspace.terminalStates.get(workspace.activeAdapterId);
+    if (!activeState || !isTerminalUsable(activeState.adapter)) {
+        return;
+    }
+
+    if (!activeState.initialized) {
+        initTerminalState(activeState);
+    }
+
+    if (activeState.websocket?.readyState === WebSocket.OPEN) {
+        requestAnimationFrame(() => fitTerminalState(activeState));
+        return;
+    }
+
+    if (activeState.websocket?.readyState === WebSocket.CONNECTING) {
+        return;
+    }
+
+    connectWebSocket(activeState);
 }
 
 function fitTerminalState(state) {
@@ -1206,31 +1311,37 @@ function sendTerminalSize(state) {
 }
 
 function connectWebSocket(state) {
-    if (state.websocket) {
-        state.websocket.close();
-    }
+    closeStateWebSocket(state);
 
     state.capabilityError = false;
     setStateStatus(state, "connecting", "Connecting...");
     const wsUrl = buildWebSocketUrl(state.adapter.id);
     const websocket = new WebSocket(wsUrl);
+    const connectionNonce = state.connectionNonce;
     state.websocket = websocket;
 
     websocket.onopen = () => {
+        if (state.websocket !== websocket || state.connectionNonce !== connectionNonce) {
+            websocket.close();
+            return;
+        }
         state.capabilityError = false;
         setStateStatus(state, "connected", "Connected");
         state.terminal.clear();
         fitTerminalState(state);
         sendTerminalSize(state);
-        setTimeout(() => sendTerminalSize(state), 300);
-        setTimeout(() => sendTerminalSize(state), 800);
-        setTimeout(() => sendTerminalSize(state), 1500);
+        state.pendingTimers.push(setTimeout(() => sendTerminalSize(state), 300));
+        state.pendingTimers.push(setTimeout(() => sendTerminalSize(state), 800));
+        state.pendingTimers.push(setTimeout(() => sendTerminalSize(state), 1500));
         if (workspace.activeAdapterId === state.adapter.id) {
             state.terminal.focus();
         }
     };
 
     websocket.onmessage = (event) => {
+        if (state.websocket !== websocket || state.connectionNonce !== connectionNonce) {
+            return;
+        }
         const data = event.data;
         if (data[0] === "o") {
             const filteredData = data.slice(1).replace(/\x1b\[\[?[IO]/g, "");
@@ -1258,16 +1369,27 @@ function connectWebSocket(state) {
     };
 
     websocket.onclose = () => {
-        state.websocket = null;
+        clearPendingTimers(state);
+        if (state.websocket === websocket) {
+            state.websocket = null;
+        }
+        if (state.connectionNonce !== connectionNonce) {
+            return;
+        }
         if (state.capabilityError) {
             return;
         }
         setStateStatus(state, "disconnected", "Disconnected");
-        state.terminal.writeln("\n\x1b[1;31mTerminal disconnected.\x1b[0m");
-        state.terminal.writeln("Click ↻ to reconnect.\n");
+        if (state.terminal) {
+            state.terminal.writeln("\n\x1b[1;31mTerminal disconnected.\x1b[0m");
+            state.terminal.writeln("Click ↻ to reconnect.\n");
+        }
     };
 
     websocket.onerror = () => {
+        if (state.websocket !== websocket || state.connectionNonce !== connectionNonce) {
+            return;
+        }
         setStateStatus(state, "disconnected", "Connection error");
     };
 }
@@ -1286,6 +1408,7 @@ function reloadActiveTerminal() {
     }
     state.terminal.clear();
     state.terminal.writeln("\x1b[1;34mReloading terminal...\x1b[0m\n");
+    disconnectTerminalState(state);
     connectWebSocket(state);
 }
 
@@ -1460,6 +1583,14 @@ window.addEventListener("resize", () => {
     if (floatingWindow && floatingWindow.style.display !== "none") {
         fitAllTerminals();
     }
+});
+
+window.addEventListener("pagehide", () => {
+    shutdownTerminalWorkspace({ disposeTerminals: true, resetSession: true });
+});
+
+window.addEventListener("beforeunload", () => {
+    shutdownTerminalWorkspace({ disposeTerminals: true, resetSession: true });
 });
 
 async function checkMcpStatus() {
